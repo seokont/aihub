@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moni-agent"
+version = "0.1.0"
+description = "MONI AI Agent Core — LangGraph PLAN/ACT/OBSERVE/VERIFY graphs, approvals, limits"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pydantic>=2.9",
+    "structlog>=24.4",
+    # The graph runtime (§2, §4).
+    "langgraph>=1.0",
+    # Checkpointing into the main PostgreSQL, so a run can be resumed by thread id.
+    # Declared here, NOT in moni-ingest: these are the agent's runtime concern, and
+    # moni-ingest is imported by rag-mcp, whose image would otherwise carry a database
+    # driver it never uses.
+    "langgraph-checkpoint-postgres>=2.0",
+    "psycopg[binary]>=3.2",
+    # Prompt files are plain markdown read at import; no runtime dependency needed.
+    # MCP client: the agent reaches odoo-mcp itself. Pinned below 2.0 to match the server
+    # (see docs/adr/0003-odoo-read-tools.md).
+    "mcp>=1.28,<2",
+    # The only model access path (§3.4): the router owns every LLM call.
+    "moni-router",
+    # Observability (§3.8): every run carries a Langfuse trace. Pinned to the 2.x line to
+    # match the self-hosted container — see docs/adr/0002-langfuse-version.md. Tracing is
+    # optional at runtime: with LANGFUSE_PUBLIC_KEY unset the tracer is a no-op, so the
+    # agent never depends on Langfuse being up.
+    "langfuse>=2,<3",
+]
+
+[tool.uv.sources]
+moni-router = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moni_agent"]
+# The prompts are data, not code: they must ship inside the package or the agent starts
+# with an empty system prompt. The loader fails loudly if they are absent.
+artifacts = ["src/moni_agent/prompts/*.md"]
+
+# Phase 2 adds approvals (interrupt/resume), write tools and the human-in-the-loop path.
+# Phase 1 is read-only by construction: the tool layer is filtered by RBAC upstream and the
+# Odoo client cannot express a write.

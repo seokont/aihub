@@ -1,0 +1,228 @@
+# MONI AI — workspace root.
+#
+# This file defines the uv workspace and the shared tooling configuration only.
+# It deliberately declares no runtime dependencies: every runtime dependency
+# belongs to exactly one package (CLAUDE.md §3.1 single responsibility, §4 stack).
+#
+# Layout authority: CLAUDE.md §5.
+
+[project]
+name = "moni-ai"
+version = "0.1.0"
+description = "MONI AI — corporate AI operating system (workspace root)"
+requires-python = ">=3.12,<3.13"
+
+[tool.uv.workspace]
+members = [
+    "gateway",
+    "agent",
+    "router",
+    "ingest",
+    "worker",
+    "mcp/odoo",
+    "mcp/rag",
+    "mcp/zoho",
+    "mcp/whatsapp",
+    "mcp/browser",
+    "mcp/git",
+]
+# The LibreChat fork (ui/) is a pnpm project, not a uv member.
+exclude = ["ui"]
+
+[dependency-groups]
+dev = [
+    "types-PyYAML>=6.0",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "httpx>=0.27",      # ASGI transport for unit tests, real HTTP for integration tests
+    "cryptography>=43", # test keypairs; also PyJWT's RS256 backend
+    # Runtime dependencies of the gateway, listed here so `uv sync --group dev` is the
+    # complete setup for lint, type-check and unit tests without building an image.
+    "fastapi>=0.115",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "uvicorn[standard]>=0.32",
+    "PyJWT[crypto]>=2.9,<3",
+    "structlog>=24.4",
+    "SQLAlchemy[asyncio]>=2.0,<3",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    # odoo-mcp (task 1.1): the MCP SDK is pinned below 2.0 on purpose — see
+    # docs/adr/0003-odoo-read-tools.md.
+    "mcp>=1.28,<2",
+    # Gateway rate limiting (task 1.3): Redis is already in the dev stack for the Phase 2
+    # task queue, so the limiter uses it rather than adding another moving part.
+    "redis>=5,<6",
+    # The task queue (task 2.6). Declared in the ROOT as well as in `worker/`, for the same reason
+    # `mcp` is: the workspace members are not installed into the test environment, so a package only
+    # `worker/` depended on could not be imported by the tests that assert the worker's queue
+    # discipline. The alternative — testing the numbers through a stub — would be a test of the stub.
+    "arq>=0.26,<1",
+    "ruff>=0.7",
+    "mypy>=1.13",
+]
+
+# ---------------------------------------------------------------------------
+# ruff
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["gateway/src", "agent/src", "router/src", "ingest/src", "mcp/*/src", "tests"]
+# Local scratch: a uv cache can be pointed inside the workspace (UV_CACHE_DIR),
+# and it must never be linted.
+#
+# `ui` is the LibreChat fork: a git submodule holding third-party code pinned to an
+# upstream tag. It is excluded because it is not ours to reformat, and because "lint clean"
+# must mean "our code is clean", not "we have an opinion about upstream's". The MONI-specific
+# UI files live in infra/ui/ and are checked by tests/smoke instead (they are YAML/env/JSON,
+# which ruff does not read).
+extend-exclude = [".uv-cache", "ui"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "BLE",  # flake8-blind-except — every broad except in security.py is deliberate
+    "UP",   # pyupgrade
+    "S",    # flake8-bandit — security-critical code (gateway policy/classifier)
+    "T20",  # flake8-print — no stray prints; use structlog (§4)
+    "RUF",
+]
+ignore = [
+    "RUF001", 
+    "RUF002", 
+    "RUF003",
+    "E501", # line length is enforced by the formatter
+]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "moni_gateway",
+    "moni_agent",
+    "moni_router",
+    "moni_ingest",
+    "moni_mcp_odoo",
+    "moni_mcp_rag",
+    "moni_mcp_zoho",
+    "moni_mcp_whatsapp",
+    "moni_mcp_browser",
+    "moni_mcp_git",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S104", "RUF012", "S105"]  # assert is the pytest API; S104 fires on our
+                               # 0.0.0.0 assertion text, not on a real bind; RUF012 on
+                               # test-double class attributes; S105 (hardcoded password) on
+                               # fixture *names* like `ODOO_TEST_VIEWER_KEY` and on the fake
+                               # values a test puts in the environment to prove precedence —
+                               # never on a real credential, which §3.11 keeps out of the tree
+"**/__init__.py" = ["F401"]
+# The realm generator prints JSON to stdout by design, and its "password" is the
+# literal ${...} placeholder that Keycloak substitutes at import time — not a secret.
+"infra/keycloak/generate_realm_export.py" = ["S105", "T201"]
+# scripts/ are operator utilities: they print reports on purpose, and the environment
+# audit legitimately contains the literal string "0.0.0.0" as a value it rejects.
+"scripts/**" = ["T201", "S104"]
+# The status probe builds SQL by interpolation on purpose (there is no ORM in a probe), and every
+# interpolated value goes through `_literal`, which asserts its shape first — including `--tool`, which
+# is the only caller-supplied one. Same reasoning and same treatment as tests/integration/** below;
+# a `noqa` per f-string would have to be repeated and would hide the rule everywhere else.
+"scripts/probe_status_answer.py" = ["S608"]
+# Integration tests interpolate into SQL on purpose (there is no ORM here): every
+# interpolated value is passed through conftest.safe_literal(), which asserts a fixed
+# shape first. Marking it once beats a noqa on every f-string.
+"tests/integration/**" = ["S608"]
+# The operator CLI prints its result as JSON: that IS its output contract.
+"gateway/src/moni_gateway/cli.py" = ["T201"]
+# The agent's honest-failure messages are user-facing Ukrainian by default (§4), so the
+# Cyrillic text is intentional, not a homoglyph accident.
+"agent/src/moni_agent/graph.py" = ["RUF001"]
+
+# ---------------------------------------------------------------------------
+# mypy — strict, per CLAUDE.md §4 ("type hints everywhere, ruff + mypy clean")
+#
+# One invocation covers the gateway sources AND the tests that exercise them, so a
+# signature change cannot pass CI by keeping the tests untyped.
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+warn_unused_configs = true
+show_error_codes = true
+# mypy must resolve the workspace packages without them being installed. `files` is set
+# so a bare `mypy` invocation uses the same target list as CI and pre-commit.
+files = ["gateway/src", "agent/src", "ingest/src", "mcp/rag/src", "tests", "infra/keycloak", "scripts"]
+mypy_path = "gateway/src:agent/src:ingest/src:mcp/rag/src"
+
+# The Langfuse SDK ships no `py.typed` marker and no stubs (checked against 2.60.10), so
+# `import langfuse` is untyped by definition. The override is scoped to the one module that
+# imports it, and `moni_agent/tracing.py` keeps every call to it behind a narrow `Any`
+# boundary — so the untyped surface cannot leak into the rest of the agent.
+[[tool.mypy.overrides]]
+module = ["moni_agent.tracing"]
+disable_error_code = ["import-untyped"]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra --strict-markers --strict-config"
+asyncio_mode = "auto"
+# Async fixtures and the tests that use them must share ONE event loop.
+#
+# Without this, a module-scoped async fixture (the odoo integration suite creates a
+# SQLAlchemy async engine + connection pool there) is built on the fixture's loop while
+# each test runs on its own loop. That works for the first test and dies from the second
+# onward with "Event loop is closed" — on Windows, reliably, because the proactor loop
+# enforces it strictly. Fixture and test scope are therefore both pinned to the module.
+asyncio_default_fixture_loop_scope = "module"
+asyncio_default_test_loop_scope = "module"
+# The workspace packages are not installed into the test environment: pytest makes
+# their sources importable instead, so `moni_gateway` resolves without an install.
+pythonpath = ["gateway/src", "agent/src", "router/src", "ingest/src", "worker/src", "mcp/*/src"]
+markers = [
+    "integration: needs the dev stack running (docker compose up) and MONI_RUN_INTEGRATION=1",
+    "odoo: needs a DEV Odoo instance (ODOO_URL, ODOO_DB) and mapped test users",
+    "zoho: needs a Zoho TEST mailbox (ZOHO_DC and the ZOHO_* OAuth values) — never the client's",
+]
+
+# ---------------------------------------------------------------------------
+# coverage
+#
+# Deliberately NOT a project-wide percentage: a global floor invites tests for
+# trivialities. The floor is enforced on the security-critical modules — token
+# verification, the audit write path and the fail-closed configuration (§4 requires
+# ≥80% on gateway policy/classifier code, which these are the basis of).
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+branch = true
+source = ["gateway/src/moni_gateway"]
+# Excluded from the floor because they are process/driver edges, exercised by the
+# integration suite and by running the stack rather than by unit tests:
+#   __main__.py   - the uvicorn entry point
+#   audit.py      - the CLI subcommand bodies (they only open a database connection;
+#                   the redaction path they use IS unit-tested, via build_cli_entry)
+omit = [
+    "gateway/src/moni_gateway/__main__.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]
+
+[tool.coverage.paths]
+moni_gateway = ["gateway/src/moni_gateway", "*/site-packages/moni_gateway"]

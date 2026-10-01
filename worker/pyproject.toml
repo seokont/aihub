@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moni-worker"
+version = "0.1.0"
+description = "MONI AI worker — background and triggered agent runs over arq (task 2.6)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "arq>=0.26",
+    "asyncpg>=0.30",
+    "sqlalchemy[asyncio]>=2.0",
+    "structlog>=24.4",
+    # The worker runs the SAME agent factory the gateway runs (ADR 0005's seam). That dependency is
+    # the point rather than an accident: a second factory would be a second agent, and the two would
+    # drift in budgets, tracing and policy — which is precisely the split ADR 0013 declines to make.
+    "moni-gateway",
+    "moni-agent",
+    # The polling trigger reads the mailbox itself, so the worker needs the Zoho client — task 2.6's
+    # step 4b is what made that concrete. It was missing until F3: `on_startup` supplied no factory,
+    # so the import would have failed inside the container at the first poll, which is the same
+    # import-time trap `mcp/zoho` hit when it reached for `moni_router`. The package is small
+    # (httpx + structlog + the MCP SDK, which `moni-agent` already pulls in), so this adds no
+    # meaningful weight to the image.
+    "moni-mcp-zoho",
+]
+
+[tool.uv.sources]
+moni-gateway = { workspace = true }
+moni-agent = { workspace = true }
+moni-mcp-zoho = { workspace = true }

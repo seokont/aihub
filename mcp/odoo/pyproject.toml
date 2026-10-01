@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moni-mcp-odoo"
+version = "0.1.0"
+description = "MONI AI odoo-mcp — typed Odoo 19 JSON-RPC tools with per-user credentials"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # The MCP SDK with its CLI extra (server + `mcp run`/`mcp dev`).
+    #
+    # Pinned below 2.0 deliberately: v2 is the new stable line but renames the server
+    # class (FastMCP -> MCPServer) and changes the transport wiring, which is a
+    # migration and not part of this task. The SDK's own README recommends the `<2`
+    # bound until a migration is done. See docs/adr/0003-odoo-read-tools.md.
+    "mcp>=1.28,<2",
+    "httpx>=0.27",
+    "pydantic>=2.9",
+    # Per-user credentials: the mapping table, Fernet helpers and the DB engine live in
+    # the gateway (it owns the schema), so odoo-mcp reuses them instead of duplicating a
+    # second connection story.
+    "moni-gateway",
+]
+
+[tool.uv.sources]
+moni-gateway = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moni_mcp_odoo"]
+
+# Phase 2 adds the write tools: they must register an action class, require approval,
+# and carry an idempotency key (run_id + step_id) per CLAUDE.md §3.3 and §3.7. Phase 1
+# is read-only by construction and the client cannot express a write.

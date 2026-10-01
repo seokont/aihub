@@ -1,0 +1,62 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moni-gateway"
+version = "0.1.0"
+description = "MONI AI Gateway — OpenAI-compatible single entry: auth, RBAC, policy, classifier, approvals, audit"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "uvicorn[standard]>=0.32",
+    # JWT validation. [crypto] pulls PyJWT's cryptography backend, which is what
+    # makes RS256/ES256 verification possible. PyJWT is pinned to a major version
+    # because token verification is security-critical (CLAUDE.md §3.2, §3.12).
+    "PyJWT[crypto]>=2.9,<3",
+    "httpx>=0.27",
+    "structlog>=24.4",
+    # Audit trail (§3.8). The audit_log table is defined once, in
+    # moni_gateway/audit.py, and Alembic points its target_metadata at it.
+    "SQLAlchemy[asyncio]>=2.0,<3",
+    "asyncpg>=0.30",
+    # Alembic is a runtime dependency of the image (not of the app process): the
+    # one-shot `migrate` compose service runs `alembic upgrade head` from the very
+    # same image, which is what keeps migrations out of app startup.
+    "alembic>=1.14",
+    # The checkpoint schema's DDL is generated from LangGraph's own exported migration
+    # list (see db/migrations/versions/20260925_0003_langgraph_checkpoints.py), so the
+    # image that runs migrations must be able to import it. Pinned to the same range the
+    # agent declares: the agent is the component that actually uses the checkpointer, and
+    # a schema generated from a different version than the one reading it is the exact
+    # drift migration 0003 exists to prevent.
+    "langgraph-checkpoint-postgres>=2.0",
+    # Per-user rate limiting (§3.6). Imported lazily by moni_gateway.ratelimit, but it is a
+    # genuine runtime dependency of the deployed gateway: without it the limiter would
+    # degrade to "no limit" on every request. Declared here, not only in the workspace dev
+    # group, because the dev group does not reach the image — that mistake made the gateway
+    # start with a limiter it could never use.
+    "redis>=5,<6",
+    # The agent loop and the LLM router, which the chat surface drives in-process.
+    #
+    # §2 draws the agent as its own box, and a separate `agent` container is the right shape
+    # once runs are long enough to move onto the Phase 2 task queue (Redis + arq). For
+    # Phase 1 the runs are short and synchronous, so they execute in the gateway process —
+    # and that makes these real gateway dependencies, as the container found when the chat
+    # route failed with ModuleNotFoundError. Splitting the service later is a deployment
+    # change, not an interface change: `moni_gateway.agent_runtime` is the only place that
+    # constructs a runner, so there is one seam to redirect.
+    "moni-agent",
+    "moni-router",
+]
+
+[tool.uv.sources]
+moni-agent = { workspace = true }
+moni-router = { workspace = true }
+
+# Explicit wheel target: the distribution name (moni-gateway) does not match the
+# import package (moni_gateway), so hatchling must be told where the sources are.
+[tool.hatch.build.targets.wheel]
+packages = ["src/moni_gateway"]

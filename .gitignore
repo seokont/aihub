@@ -1,0 +1,73 @@
+# --- Secrets (CLAUDE.md §3.11: secrets live only in the environment) ----------
+.env
+.env.*
+!.env.example
+# Any depth: an `infra/.env` or `ui/.env` produced by a tool running from a
+# subdirectory is still a secret. Root-anchored patterns alone do not catch those.
+**/.env
+**/.env.*
+!**/.env.example
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# --- uv ----------------------------------------------------------------------
+# uv.lock is intentionally committed (reproducible installs).
+# A workspace-local uv cache (UV_CACHE_DIR) must never be committed.
+.uv-cache/
+
+# --- Node / UI (LibreChat fork lands in Phase 1) ------------------------------
+node_modules/
+.pnpm-store/
+ui/client/dist/
+ui/api/dist/
+*.tsbuildinfo
+npm-debug.log*
+pnpm-debug.log*
+
+# --- Local infra state / dumps ------------------------------------------------
+*.sql
+*.dump
+infra/data/
+infra/backups/
+
+# --- Editors / OS -------------------------------------------------------------
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Local notes --------------------------------------------------------------
+*.local.md
+
+# --- Local run artefacts ------------------------------------------------------
+# Acceptance-harness output (verify.ps1) and ad-hoc logs.
+verify-run.log
+*.verify.log
+# Tunnel supervisor log (scripts/tunnel-vllm.ps1). It records every reconnect, so it is exactly
+# the file that must survive a crash — and exactly the file that should never be committed.
+logs/
+
+# --- Ad-hoc probe scripts -----------------------------------------------------
+# A developer's `check-*.ps1` is a scratch probe, not project code: it tends to hardcode a
+# credential or a machine-specific path, and one of them did — a Groq API key sat in a
+# `check-groq.ps1` at the repository root, caught by the scan run immediately before the first
+# commit. Ignoring the pattern means the next probe cannot reach the index by accident.
+# Project scripts belong in `scripts/` with a descriptive name (`verify.ps1`, `load-env.ps1`).
+check-*.ps1

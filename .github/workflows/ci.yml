@@ -1,0 +1,108 @@
+# CI — every push and pull request.
+#
+# Two jobs, mirroring `make lint` and `make test` so a green CI means a green local run:
+#   * lint       — ruff check, ruff format --check, mypy --strict
+#   * unit-tests — unit + smoke tests with the coverage floor on the security modules
+#   * audit      — loopback-only ports, complete .env.example, no committed secret
+#
+# The integration job (compose + real Keycloak round trip) lives in integration.yml and
+# runs on demand or nightly: it needs the whole stack and is slower than it is useful
+# on every push.
+#
+# No secret is required: the unit tests generate their own RSA keypair and use stubs.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  UV_FROZEN: "0"
+
+jobs:
+  lint:
+    name: lint & types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --all-packages --group dev
+
+      - name: ruff check
+        run: uv run --group dev ruff check --output-format=github .
+
+      - name: ruff format --check
+        run: uv run --group dev ruff format --check .
+
+      - name: mypy --strict
+        # Through the Makefile, not a second hard-coded list. This step used to name its own
+        # targets — `gateway/src tests infra/keycloak scripts` — which quietly stopped being the
+        # same set `make typecheck` uses, so the agent, router, ingest and rag-mcp sources were
+        # never typechecked in CI. One list, one place.
+        run: make typecheck
+
+  unit-tests:
+    name: unit & smoke tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --all-packages --group dev
+
+      - name: pytest (hermetic: no containers, no network)
+        run: |
+          uv run --group dev pytest tests/unit tests/smoke \
+            --cov=moni_gateway --cov-branch --cov-report=term-missing:skip-covered
+
+      - name: coverage floor on the security-critical modules
+        # Token verification, the audit write path and the fail-closed configuration.
+        # A project-wide floor would reward tests for trivialities; §4 asks for ≥80% on
+        # gateway policy/classifier code, and these are the Phase 0 equivalent. The
+        # floor is 75 with a margin: ~4 points above the real number, so a genuine
+        # regression trips it while churn in unrelated code does not.
+        run: |
+          uv run --group dev pytest tests/unit/gateway/test_security.py \
+            tests/unit/gateway/test_audit.py tests/unit/gateway/test_settings.py \
+            --cov=moni_gateway.security --cov=moni_gateway.audit --cov=moni_gateway.config \
+            --cov-branch --cov-fail-under=75 --cov-report=term-missing
+
+      - name: Environment audit (loopback ports, .env.example, secrets)
+        run: uv run --group dev python scripts/check_environment.py
+
+  # A quick guard that the compose file stays valid YAML with substituted variables.
+  compose-config:
+    name: compose config
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render the dev stack configuration
+        run: |
+          cp .env.example .env
+          docker compose --env-file .env -f infra/docker-compose.dev.yml config >/dev/null
+          echo "compose config OK"
+          rm -f .env

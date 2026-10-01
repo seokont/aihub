@@ -1,0 +1,36 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moni-mcp-rag"
+version = "0.1.0"
+description = "MONI AI rag-mcp — ACL-filtered retrieval over pgvector"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pydantic>=2.9",
+    "structlog>=24.4",
+    # The MCP server SDK, pinned below 2.0 to match odoo-mcp
+    # (see docs/adr/0003-odoo-read-tools.md).
+    "mcp>=1.28,<2",
+    # The corpus itself: DocumentStore (the schema plus the ACL-filtered search) and the TEI
+    # embedder. Shared with moni-ingest so retrieval and ingestion cannot disagree about
+    # either — a second implementation of the ACL predicate is exactly the drift that would
+    # let a document leak.
+    "moni-ingest",
+]
+
+[tool.uv.sources]
+moni-ingest = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moni_mcp_rag"]
+
+# Deliberately NOT a dependency of moni-gateway. Retrieval needs one setting (DATABASE_URL) and
+# one embedder; going through the gateway's settings module dragged moni-agent — and with it
+# LangGraph and the checkpoint stack — into this image, and broke the build outright when those
+# workspace members were not staged. See context_from_env.
+#
+# Phase 1 scope: one read tool, `search_documents`. Retrieval filters by the requesting user's
+# ACL *in SQL*, before similarity ranking is returned (CLAUDE.md §3.10). Write tools are Phase 2
+# and would need an approval path and an action_class change.

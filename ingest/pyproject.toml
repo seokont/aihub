@@ -1,0 +1,28 @@
+[project]
+name = "moni-ingest"
+version = "0.1.0"
+description = "MONI AI ingestion — RAG document pipelines and Corporate Memory"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "pydantic>=2.9",
+    "structlog>=24.4",
+    # Document parsing. pypdf is the primary PDF reader; pdfplumber is the fallback for
+    # files pypdf extracts nothing from (scanned-then-OCR'd PDFs and some generators).
+    "pypdf>=5.1",
+    "pdfplumber>=0.11",
+    "python-docx>=1.1",
+    # Token counting for chunking. Deliberately NOT a bge-m3 tokenizer: that would mean a
+    # multi-GB model download to count tokens. `o200k_base` is a widely-used BPE vocabulary
+    # and gives a stable, dense, deterministic count — see chunking.py for the rationale.
+    "tiktoken>=0.8",
+    # Database. SQLAlchemy 2 async + asyncpg, matching the gateway and the audit path.
+    # The store lives here rather than in moni-mcp-rag so that ingestion and retrieval cannot
+    # disagree about the schema or the ACL predicate — they share one definition.
+    "SQLAlchemy[asyncio]>=2.0,<3",
+    "asyncpg>=0.30",
+    # TEI embeddings over HTTP (used by both ingestion and query-time search).
+    "httpx>=0.27",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moni_ingest"]

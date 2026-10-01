@@ -1,0 +1,945 @@
+# MONI AI — dev infrastructure (Phase 0).
+#
+# Scope: postgres+pgvector (state/audit/approvals/RAG), redis (task queue), nginx
+# (host entrypoint), keycloak (identity), langfuse + its own postgres
+# (observability) and the gateway (FastAPI: JWT validation today, policy/RBAC/
+# approvals/audit in later tasks).
+#
+# Rules applied (CLAUDE.md §3):
+#   §3.1  every published port is bound to 127.0.0.1 — nothing listens on 0.0.0.0;
+#         the gateway and both internal postgres instances publish no port at all;
+#   §3.2  every request is identified by a Keycloak JWT;
+#   §3.11 credentials come from .env only — no defaults, no secret literals here.
+#
+# Usage (see ../README.md):
+#   cp .env.example .env      # then edit
+#   docker compose --env-file .env -f infra/docker-compose.dev.yml up -d
+
+name: ${COMPOSE_PROJECT_NAME:-moni-ai-dev}
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 16 + pgvector — system of record: state, audit, approvals, RAG.
+  # Internal only: no published port.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set in .env (see .env.example)}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env (see .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set in .env (see .env.example)}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # PUBLISHED on the loopback interface only. Host-run tooling needs it: the gateway
+      # CLI (`python -m moni_gateway.cli map-odoo-user`) and any pytest run that resolves
+      # Odoo credentials connect to 127.0.0.1:${POSTGRES_PORT}. The default is 55432, not
+      # 5432, because a native PostgreSQL commonly already occupies 5432 — and it MUST
+      # match DATABASE_URL in .env, or host-run commands reach the wrong database (§3.1).
+      - "127.0.0.1:${POSTGRES_PORT:-55432}:5432"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -h 127.0.0.1',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - corporate-ai-net
+
+  # ---------------------------------------------------------------------------
+  # Redis 7 — arq task queue, cache, rate limits. Password-protected even though
+  # it is only on the internal network. Internal only: no published port.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env (see .env.example)}
+      - --save
+      - "60"
+      - "1"
+      - --appendonly
+      - "yes"
+    environment:
+      # Required by the healthcheck below: compose does not inject REDIS_PASSWORD
+      # into the container env on its own (it is only interpolated into `command`),
+      # so without this line `redis-cli -a "$REDIS_PASSWORD"` authenticates with an
+      # empty password and the service is reported unhealthy forever.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env (see .env.example)}
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'redis-cli -a "$$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - corporate-ai-net
+
+  # ---------------------------------------------------------------------------
+  # Keycloak — identity provider (§3.2). Dev mode (start-dev): HTTP, in-container
+  # realm import, no TLS.
+  #
+  # The realm is imported on start from infra/keycloak/realm-export.json, mounted
+  # read-only at /opt/keycloak/data/import/. Keycloak persists to its own H2
+  # database in the keycloakdata volume, so `down` (without -v) keeps users and
+  # `down -v` forces a clean re-import. See ../README.md.
+  #
+  # KC_HOSTNAME must be the URL browsers use, because Keycloak puts it in the
+  # `iss` claim and the gateway validates that claim exactly. It is therefore
+  # http://127.0.0.1:${KEYCLOAK_PORT}, NOT the in-network service name.
+  # ---------------------------------------------------------------------------
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    restart: unless-stopped
+    command:
+      - start-dev
+      - --import-realm
+      - --health-enabled=true
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:?KEYCLOAK_ADMIN must be set in .env (see .env.example)}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?KEYCLOAK_ADMIN_PASSWORD must be set in .env (see .env.example)}
+      KC_HOSTNAME: http://127.0.0.1:${KEYCLOAK_PORT:-8081}
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+      # Substituted into realm-export.json at import time (test user passwords and the
+      # confidential UI client's secret).
+      #
+      # These MUST be listed here, not merely present in .env: Keycloak's realm import
+      # resolves `${VAR}` against ITS OWN process environment, and compose does not inject
+      # a variable into a container just because it is in the `.env` file. Omitting one is
+      # silent and nasty — the literal string `${MONI_UI_WEB_CLIENT_SECRET}` is stored as
+      # the client secret, so the client exists, looks configured, and every login fails
+      # with a 401 that names nothing.
+      MONI_TEST_USER_PASSWORD: ${MONI_TEST_USER_PASSWORD:?MONI_TEST_USER_PASSWORD must be set in .env (see .env.example)}
+      MONI_UI_WEB_CLIENT_SECRET: ${MONI_UI_WEB_CLIENT_SECRET:?MONI_UI_WEB_CLIENT_SECRET must be set in .env (see .env.example)}
+    ports:
+      - "127.0.0.1:${KEYCLOAK_PORT:-8081}:8080"
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+      - keycloakdata:/opt/keycloak/data
+    healthcheck:
+      # The Keycloak image deliberately ships no HTTP client, so this uses bash's
+      # /dev/tcp support, exactly as the upstream health-check guide prescribes.
+      # Health endpoints live on the management port (9000) and require
+      # --health-enabled=true (set in `command`). start_period is long because
+      # dev-mode startup plus realm import takes a while.
+      test:
+        [
+          "CMD-SHELL",
+          "exec 3<>/dev/tcp/127.0.0.1/9000; printf 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3; grep -q '200 OK' <&3",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    networks:
+      - corporate-ai-net
+
+  # ---------------------------------------------------------------------------
+  # Langfuse database — separate PostgreSQL instance. Langfuse owns its schema and
+  # must not share the application database (§3.8 audit integrity).
+  # Internal only: no published port.
+  # ---------------------------------------------------------------------------
+  langfuse-db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${LANGFUSE_DB_USER:?LANGFUSE_DB_USER must be set in .env (see .env.example)}
+      POSTGRES_PASSWORD: ${LANGFUSE_DB_PASSWORD:?LANGFUSE_DB_PASSWORD must be set in .env (see .env.example)}
+      POSTGRES_DB: ${LANGFUSE_DB_NAME:?LANGFUSE_DB_NAME must be set in .env (see .env.example)}
+    volumes:
+      - langfuse_dbdata:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -h 127.0.0.1',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - corporate-ai-net
+
+  # ---------------------------------------------------------------------------
+  # Langfuse — self-hosted tracing backend. Only needs to be running in Phase 0;
+  # the gateway/agent wire traces into it in Phase 1.
+  #
+  # Pinned to the 2.x line on purpose: Langfuse 3.x requires ClickHouse, Redis and
+  # S3-compatible blob storage for the web container to report healthy, which is
+  # infrastructure this task does not add. See README.md for the upgrade note.
+  # ---------------------------------------------------------------------------
+  langfuse:
+    image: langfuse/langfuse:2
+    restart: unless-stopped
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${LANGFUSE_DB_USER}:${LANGFUSE_DB_PASSWORD}@langfuse-db:5432/${LANGFUSE_DB_NAME}
+      # The browser-facing URL is the published port, not the container port.
+      NEXTAUTH_URL: http://127.0.0.1:${LANGFUSE_PORT:-3001}
+      # Next.js binds to the HOSTNAME env var, and Docker sets it to the container
+      # id — so without this the server listens ONLY on the container's bridge IP
+      # and 127.0.0.1 inside the container refuses connections (the healthcheck,
+      # and anything exec'd, would never see it). Langfuse's documented value for
+      # containerised deployments.
+      HOSTNAME: "0.0.0.0"
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:?LANGFUSE_NEXTAUTH_SECRET must be set in .env (see .env.example)}
+      SALT: ${LANGFUSE_SALT:?LANGFUSE_SALT must be set in .env (see .env.example)}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:?LANGFUSE_ENCRYPTION_KEY must be set in .env (see .env.example)}
+      # First-run admin account (dev only). Documented in ../README.md.
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID:-moni}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME:-MONI AI}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID:-moni-ai}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME:-MONI AI}
+      # Seeded at project creation: Langfuse only writes api_keys rows when it creates
+      # the project, so these must be present on the FIRST start of a fresh database.
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY:?LANGFUSE_INIT_PROJECT_PUBLIC_KEY must be set in .env (see .env.example)}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY:?LANGFUSE_INIT_PROJECT_SECRET_KEY must be set in .env (see .env.example)}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:?LANGFUSE_INIT_USER_EMAIL must be set in .env (see .env.example)}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-MONI AI Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:?LANGFUSE_INIT_USER_PASSWORD must be set in .env (see .env.example)}
+      LANGFUSE_LOG_LEVEL: ${LANGFUSE_LOG_LEVEL:-info}
+    ports:
+      - "127.0.0.1:${LANGFUSE_PORT:-3001}:3000"
+    healthcheck:
+      # This image ships wget but NOT curl, so use wget (the reverse of nginx:stable).
+      # The endpoint reports liveness only; pass ?failIfDatabaseUnavailable=true to
+      # also require the database in the probe.
+      test:
+        [
+          "CMD-SHELL",
+          "wget -q -O /dev/null http://127.0.0.1:3000/api/public/health",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    networks:
+      - corporate-ai-net
+
+  # ---------------------------------------------------------------------------
+  # migrate — one-shot schema service (CLAUDE.md §3.8).
+  #
+  # Runs `alembic upgrade head` once, from the SAME image as the gateway, and exits
+  # 0. The gateway waits for `service_completed_successfully`, so the schema is in
+  # place before the first request and no application process ever runs DDL at
+  # import time. There is no published port and no restart policy: if a migration
+  # fails, the stack stops instead of running against a half-migrated database.
+  #
+  # Requirements: DATABASE_URL is the app's own name for the connection string, so
+  # the migrate service and the gateway are guaranteed to target the same database.
+  # ---------------------------------------------------------------------------
+  migrate:
+    build:
+      context: ..
+      dockerfile: gateway/Dockerfile
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["alembic", "-c", "db/alembic.ini", "upgrade", "head"]
+    environment:
+      MONI_ENV: dev
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER must be set in .env}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set in .env}
+    healthcheck:
+      # Doubles as the "which revision is applied" probe:
+      #   docker inspect --format '{{json .State.Health}}' <migrate container>
+      test: ["CMD", "alembic", "-c", "db/alembic.ini", "current"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    networks:
+      - corporate-ai-net
+
+  # ---------------------------------------------------------------------------
+  # Gateway — FastAPI. Today: validates the Keycloak JWT (§3.2), audits every
+  # attempt to audit_log (§3.8) and answers /health + /auth/me. Internal only: NO
+  # published port; nginx reaches it over corporate-ai-net (single entry, §3.1).
+  # ---------------------------------------------------------------------------
+  gateway:
+    build:
+      # Build context is the repository root; the Dockerfile copies gateway/** + db/**.
+      context: ..
+      dockerfile: gateway/Dockerfile
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      postgres:
+        # Audit writes need the database, so wait for it (not just for `migrate`).
+        condition: service_healthy
+      migrate:
+        # The schema must exist before the gateway serves a request.
+        condition: service_completed_successfully
+    environment:
+      GATEWAY_PORT: "8080"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Marks the local stack, which is allowed to run with the .env.example
+      # placeholders. Any other value stops the gateway on a `change-me*` credential.
+      MONI_ENV: dev
+      # Audit trail target. Built here from the POSTGRES_* parts so the async URL can
+      # never disagree with what postgres was initialised with; .env carries a
+      # DATABASE_URL for running alembic/psql from the host.
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER must be set in .env}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set in .env}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-5}
+      # Internal address used for OIDC discovery and JWKS retrieval.
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-moni}
+      # Public issuer base. The gateway derives the expected `iss` as
+      # <KEYCLOAK_ISSUER>/realms/<KEYCLOAK_REALM> and compares it to the token.
+      KEYCLOAK_ISSUER: http://127.0.0.1:${KEYCLOAK_PORT:-8081}
+      KEYCLOAK_AUDIENCE: ${KEYCLOAK_AUDIENCE:-moni-gateway}
+      OIDC_CACHE_TTL_SECONDS: ${OIDC_CACHE_TTL_SECONDS:-300}
+      OIDC_HTTP_TIMEOUT_SECONDS: ${OIDC_HTTP_TIMEOUT_SECONDS:-5}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://127.0.0.1:3080}
+      # --- Agent surface (task 1.3) -------------------------------------------
+      # Where the gateway reaches odoo-mcp. Container-facing service name: the gateway is
+      # the only client, and MCP is never published for the UI (§3.1).
+      MONI_MCP_ODOO_URL: ${MONI_MCP_ODOO_URL:-http://mcp-odoo:8011/mcp}
+      # Where the gateway reaches zoho-mcp (task 2.5). Passed through with `-` rather than `:-` on
+      # purpose: an EMPTY value must stay empty, because empty is how `Settings.mcp_servers` says
+      # "this server is not configured" and skips it. With `:-` an emptied value would fall back to
+      # the default URL, and the gateway would then wait for a container the default compose profile
+      # does not start — every agent run failing on a mailbox most stands do not have.
+      MONI_MCP_ZOHO_URL: ${MONI_MCP_ZOHO_URL-}
+      # Rate limiting (§3.6). Container-facing again — redis publishes no host port at
+      # all, so a limiter only works from inside the network by design.
+      MONI_REDIS_URL: ${MONI_REDIS_URL:?MONI_REDIS_URL must be set in .env (see .env.example)}
+      AGENT_RATE_LIMIT_PER_HOUR: ${AGENT_RATE_LIMIT_PER_HOUR:-30}
+      AGENT_RATE_LIMIT_WINDOW_SECONDS: ${AGENT_RATE_LIMIT_WINDOW_SECONDS:-3600}
+      # Agent loop caps, read by moni_agent.limits.RunLimits.from_env().
+      AGENT_MAX_STEPS: ${AGENT_MAX_STEPS:-12}
+      AGENT_MAX_RETRIES_PER_TOOL: ${AGENT_MAX_RETRIES_PER_TOOL:-2}
+      AGENT_WALL_CLOCK_SECONDS: ${AGENT_WALL_CLOCK_SECONDS:-90}
+      # HMAC key for the signed `/approvals/{id}?t=...` link (task 2.2b, §3.3). Passed through as
+      # OPTIONAL (`:-`), not required (`:?`): an empty value is a supported configuration in which
+      # no link is minted and the page answers 503, and refusing to boot without a convenience key
+      # would make the *pause* — the safety property — depend on it.
+      #
+      # It has to be listed here at all because this file enumerates each service's environment
+      # rather than passing `.env` wholesale: a variable that exists in `.env` and in Settings is
+      # still invisible inside the container until it is named. That is how the page first answered
+      # 503 on a stand whose `.env` already had the key.
+      MONI_APPROVAL_LINK_KEY: ${MONI_APPROVAL_LINK_KEY:-}
+      # The model the agent calls, and the locally-served model name.
+      #
+      # ADDRESS SPLIT — the same trap as LANGFUSE_HOST below. .env carries the HOST-facing
+      # URL (http://127.0.0.1:8001/v1) because that is what host-run commands and the
+      # router's own tests use. Inside a container 127.0.0.1 is the container itself, so
+      # passing it through makes every agent run fail with "could not reach the model".
+      # `host.docker.internal` is Docker Desktop's name for the host; on Linux it needs
+      # `extra_hosts: host-gateway`, and a vLLM running in compose instead would use its
+      # service name. VLLM_BASE_URL_FOR_CONTAINERS overrides without editing this file.
+      VLLM_BASE_URL: ${VLLM_BASE_URL_FOR_CONTAINERS:-http://host.docker.internal:8001/v1}
+      VLLM_API_KEY: ${VLLM_API_KEY:?VLLM_API_KEY must be set in .env (see .env.example)}
+      VLLM_MODEL: ${VLLM_MODEL:-corporate-main}
+      # Tracing (§3.8). Optional: with no public key the agent's tracer is a no-op.
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse:3000}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      # The per-user Odoo credentials the agent resolves for each run (§3.2).
+      MONI_CRED_KEY: ${MONI_CRED_KEY:?MONI_CRED_KEY must be set in .env (see .env.example)}
+      ODOO_URL: ${ODOO_URL:?ODOO_URL must be set in .env (see .env.example)}
+      ODOO_DB: ${ODOO_DB:?ODOO_DB must be set in .env (see .env.example)}
+      # Cloud egress for levels B and C (§3.4, task 2.4). `-` and not `:-`, deliberately: an empty
+      # value is *how* the router is told there is no cloud, and it then degrades to the local model
+      # (§3.12). A `:-` would substitute a default and quietly turn "not configured" into "configured".
+      #
+      # Named here explicitly because this file previously said the opposite: it recorded a decision
+      # not to name CLOUD_* "until a key exists", and that decision was correct while none did. It
+      # stopped being correct the moment a key was placed in `.env` — a file this service cannot see
+      # except through this list, since the gateway has no `env_file` and **every** variable it reads
+      # is enumerated here. The symptom of getting this wrong is the worst kind: `.env` looks right,
+      # the container is healthy, and every B/C call silently degrades to local with nothing naming
+      # the cause. `CLOUD_PROVIDER` must be a member of `moni_router.provider.SUPPORTED_PROVIDERS`.
+      CLOUD_PROVIDER: ${CLOUD_PROVIDER:-}
+      CLOUD_BASE_URL: ${CLOUD_BASE_URL:-}
+      CLOUD_API_KEY: ${CLOUD_API_KEY:-}
+      CLOUD_MODEL: ${CLOUD_MODEL:-}
+    healthcheck:
+      # No curl/wget in python:slim — use the interpreter that is already there.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request as u; u.urlopen('http://127.0.0.1:8080/health', timeout=2).read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - corporate-ai-net
+
+  # ---------------------------------------------------------------------------
+  # odoo-mcp — the Odoo read tools (Phase 1, §3.2/§3.3).
+  #
+  # Every call runs with the requesting user's OWN Odoo credentials, resolved from
+  # odoo_user_map by the Keycloak subject; an unmapped subject is a hard error and no
+  # shared account exists anywhere. The server is read-only: the client refuses any
+  # method outside its read allowlist.
+  #
+  # It talks to Odoo at ODOO_URL, which is an external endpoint (the DEV/staging Odoo
+  # instance) — never a service in this file.
+  # ---------------------------------------------------------------------------
+  mcp-odoo:
+    build:
+      # Same build context as the gateway (the repo root) but its own Dockerfile:
+      # odoo-mcp needs the MCP SDK, which the gateway image deliberately does not carry.
+      context: ..
+      dockerfile: mcp/odoo/Dockerfile
+    restart: unless-stopped
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      MONI_ENV: dev
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER must be set in .env}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set in .env}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Odoo instance (external; DEV/staging during Phase 1).
+      ODOO_URL: ${ODOO_URL:?ODOO_URL must be set in .env (see .env.example)}
+      ODOO_DB: ${ODOO_DB:?ODOO_DB must be set in .env (see .env.example)}
+      ODOO_TIMEOUT_SECONDS: ${ODOO_TIMEOUT_SECONDS:-30}
+      ODOO_MAX_ATTEMPTS: ${ODOO_MAX_ATTEMPTS:-3}
+      MONI_CRED_KEY: ${MONI_CRED_KEY:?MONI_CRED_KEY must be set in .env (see .env.example)}
+      # MUST be 0.0.0.0 inside the container, NOT the 127.0.0.1 that .env carries.
+      #
+      # .env holds 127.0.0.1 because that is where the *published* port is bound, and
+      # Compose would otherwise interpolate it straight into the server, making uvicorn
+      # listen only on the container's loopback. The failure mode is nasty and silent: the
+      # healthcheck (exec'd inside the container) passes, `docker compose ps` says healthy,
+      # and every connection through the published port dies with "Server disconnected
+      # without sending a response". Same trap as the `HOSTNAME: "0.0.0.0"` note on the
+      # langfuse service above.
+      #
+      # This does not weaken §3.1: the exposure boundary is the host-side `ports:` mapping
+      # below, which stays 127.0.0.1:8011. 0.0.0.0 here means the compose network — the only
+      # place the gateway (and nothing else) reaches it.
+      MONI_MCP_ODOO_HOST: "0.0.0.0"
+      MONI_MCP_ODOO_PORT: ${MONI_MCP_ODOO_PORT:-8011}
+    # The HTTP transport is published on 127.0.0.1 ONLY (§3.1). The stdio transport is
+    # how an MCP host launches the server directly, and does not use this port.
+    ports:
+      - "127.0.0.1:${MONI_MCP_ODOO_PORT:-8011}:8011"
+    command: ["python", "-m", "moni_mcp_odoo", "serve"]
+    healthcheck:
+      # Deliberately does NOT call a tool: at startup there is no Keycloak subject to act
+      # for, and a probe that hit Odoo would report the *Odoo* instance's health as this
+      # container's. What "healthy" means here is that the package imports and the tool
+      # registry is complete — which is exactly what a broken image would fail.
+      #
+      # "Complete" is asserted as **the registry matching the handler table**, not as a count.
+      # It used to be `assert len(TOOL_REGISTRY) == 7`, which was true until task 2.2b made the
+      # registry mode-dependent: on a dev stand `echo_write` is advertised too, so the same image
+      # that is correct reported *unhealthy* — and since the gateway waits for this container to be
+      # healthy, the whole stack refused to start. A count cannot express a set that legitimately
+      # has two sizes; the equality can, and it is the invariant that actually matters (§3.3: no
+      # declaration without a handler, no handler without a declaration).
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          from moni_mcp_odoo.server import TOOL_REGISTRY as R;
+          from moni_mcp_odoo.tools import TOOL_FUNCTIONS as F;
+          assert sorted(R) == sorted(F)
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - corporate-ai-net
+
+  # ---------------------------------------------------------------------------
+  # rag-mcp — ACL-filtered document retrieval (task 1.5, §3.10).
+  #
+  # Same treatment as odoo-mcp: internal network only, published on 127.0.0.1 purely so a
+  # developer can point a probe at it. The UI never calls an MCP server (§3.1).
+  #
+  # The ACL is enforced by this server, in SQL, from the roles on the identity channel — so the
+  # service holds no per-user secret and needs no Odoo credentials. It does need the corpus:
+  # DATABASE_URL for doc_chunks/doc_sources, and the TEI embedder to embed the query.
+  # ---------------------------------------------------------------------------
+  mcp-rag:
+    build:
+      context: ..
+      dockerfile: mcp/rag/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        # The doc tables must exist before a search can run (migration 0004).
+        condition: service_completed_successfully
+    environment:
+      MONI_ENV: dev
+      # The same database the gateway reads, built from the same parts so the two can never
+      # disagree about which database holds the corpus.
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER must be set in .env}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set in .env}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Container-facing embedding endpoint. The same address split as the gateway's
+      # VLLM_BASE_URL: `.env` holds whatever the HOST needs (http://127.0.0.1:8082/v1),
+      # while this container needs an address it can actually reach — inside a container
+      # 127.0.0.1 is the container itself. host.docker.internal is Docker Desktop's name for
+      # the host, and 18082 is the portproxy port for the GPU host's 8082.
+      EMBEDDINGS_BASE_URL: ${EMBEDDINGS_BASE_URL_FOR_CONTAINERS:-http://host.docker.internal:18082/v1}
+      EMBEDDINGS_MODEL: ${EMBEDDINGS_MODEL:-BAAI/bge-m3}
+      # Optional cross-encoder rerank. Unset means "no reranking", which is a supported state.
+      RERANKER_BASE_URL: ${RERANKER_BASE_URL_FOR_CONTAINERS:-}
+      MONI_MCP_RAG_HOST: "0.0.0.0"
+      MONI_MCP_RAG_PORT: "8012"
+    ports:
+      # 127.0.0.1 ONLY (§3.1).
+      - "127.0.0.1:${MONI_MCP_RAG_PORT:-8012}:8012"
+    extra_hosts:
+      # The TEI endpoint usually lives on the host, so the container needs this alias — the
+      # same reason the gateway has it.
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      # Deliberately does not perform a search: at startup there is no user identity to search
+      # as, and a probe that embedded a query would report the *embedding service's* health as
+      # this container's. What "healthy" means here is that the package imports and the tool
+      # registry is complete — which is what a broken image fails.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import moni_mcp_rag.server as s; assert len(s.TOOL_REGISTRY) == 1"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - corporate-ai-net
+
+  # ---------------------------------------------------------------------------
+  # zoho-mcp — Zoho Mail read/draft/send (task 2.5, §3.3, §3.4, §3.5).
+  #
+  # Same treatment as the other two MCP servers: internal network only, published on 127.0.0.1
+  # purely so a developer can point a probe at it. The UI never calls an MCP server (§3.1).
+  #
+  # It needs no database and no Odoo credentials — five ZOHO_* values and outbound HTTPS. That is
+  # also why it has no `depends_on`: there is nothing in the stack it must wait for, and making it
+  # wait on `migrate` would tie a mail server to a schema it does not read.
+  #
+  # The mailbox is the TEST one during Phase 2 (never the client's real mailbox — the task's own
+  # scope). The credentials are read from the environment; see .env.example.
+  # ---------------------------------------------------------------------------
+  mcp-zoho:
+    # **Profile-gated, so the default stack is unchanged.** This service needs a real mailbox and a
+    # Zoho OAuth client, which a checkout does not have; starting it by default would either need
+    # required `ZOHO_*` values — and `:?` is evaluated even for a service a profile excludes, so it
+    # would break `make up` for everyone — or exit on every start and fail `up --wait`. Neither is
+    # acceptable for a service most stands do not need yet.
+    #
+    # Enable mail with:
+    #   docker compose --env-file .env -f infra/docker-compose.dev.yml --profile zoho up -d
+    # after setting ZOHO_* and MONI_MCP_ZOHO_URL in .env (see .env.example). The gateway skips this
+    # server entirely while `MONI_MCP_ZOHO_URL` is empty.
+    profiles: ["zoho"]
+    build:
+      context: ..
+      dockerfile: mcp/zoho/Dockerfile
+    restart: unless-stopped
+    environment:
+      MONI_ENV: dev
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # `:-` rather than `:?`, because an unset variable must not break the *default* stack (see the
+      # profile note above). The server refuses to start when any of these is empty, so an operator
+      # who enables the profile without credentials gets an exited container with
+      # `zoho_startup_refused` in its log — loud, and impossible to mistake for a working mailbox.
+      ZOHO_DC: ${ZOHO_DC:-}
+      ZOHO_ACCOUNT_ID: ${ZOHO_ACCOUNT_ID:-}
+      ZOHO_CLIENT_ID: ${ZOHO_CLIENT_ID:-}
+      ZOHO_CLIENT_SECRET: ${ZOHO_CLIENT_SECRET:-}
+      ZOHO_REFRESH_TOKEN: ${ZOHO_REFRESH_TOKEN:-}
+      # MUST be 0.0.0.0 inside the container, NOT the 127.0.0.1 that the published port is bound
+      # to. Same trap as odoo-mcp: the healthcheck (exec'd inside) would pass while every
+      # connection through the published port died, because the server would be listening on the
+      # container's own loopback. §3.1 is not weakened — the boundary is the host-side mapping.
+      MONI_MCP_ZOHO_HOST: "0.0.0.0"
+      MONI_MCP_ZOHO_PORT: ${MONI_MCP_ZOHO_PORT:-8092}
+    ports:
+      # 127.0.0.1 ONLY (§3.1).
+      - "127.0.0.1:${MONI_MCP_ZOHO_PORT:-8092}:8092"
+    healthcheck:
+      # Import-time, and it asserts the registry matches the handler table rather than a bare count:
+      # a count alone passes if the wrong four tools are registered, and the equality is the
+      # invariant §3.3 actually needs (no declaration without a handler, no handler without a
+      # declaration).
+      #
+      # It deliberately does not call a tool: at startup there is no Keycloak subject to act for,
+      # and a probe that authenticated would report *Zoho's* health as this container's.
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import moni_mcp_zoho.server as s;
+          assert len(s.TOOL_REGISTRY) == 4 and set(s.TOOL_REGISTRY) == set(s._HANDLERS)
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - corporate-ai-net
+
+  # ---------------------------------------------------------------------------
+  # worker — background and triggered agent runs (task 2.6, ADR 0013).
+  #
+  # **Always-on, and it publishes nothing.** No `ports:` mapping at all: it takes work from Redis and
+  # talks out to Postgres, Redis and the MCP servers, all on the internal network, so there is nothing
+  # for the host to reach (§3.1). `tests/smoke/test_layout.py` asserts the absence, because "no
+  # published port" is a property that is easy to add back by accident and hard to notice.
+  #
+  # It is not gated behind a profile, deliberately (the alternative was rejected): without `ZOHO_*` it
+  # starts, reports healthy and serves the queue with only its polling trigger dormant, so the queue is
+  # exercised by `make up` instead of being hidden behind credentials it does not need. The dormancy is
+  # a configuration flag (`WorkerConfig.polling_enabled`), not a failure it discovers by trying.
+  #
+  # It runs the SAME agent as the gateway (ADR 0005's factory seam), so its environment mirrors the
+  # gateway's relevant subset — which is also why it holds no credential the gateway stack does not
+  # already hold. The ZOHO_* values are `:-` rather than `:?`: an unset mailbox must leave the trigger
+  # dormant, not stop the worker.
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: ..
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      MONI_ENV: dev
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?POSTGRES_USER must be set in .env}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set in .env}
+      MONI_REDIS_URL: ${MONI_REDIS_URL:?MONI_REDIS_URL must be set in .env (see .env.example)}
+      # --- the queue's own knobs (task 2.6) ------------------------------------
+      WORKER_MAX_JOBS: ${WORKER_MAX_JOBS:-2}
+      WORKER_PER_USER_CONCURRENCY: ${WORKER_PER_USER_CONCURRENCY:-1}
+      WORKER_TIMEOUT_MARGIN_SECONDS: ${WORKER_TIMEOUT_MARGIN_SECONDS:-30}
+      WORKER_KEEP_RESULT_SECONDS: ${WORKER_KEEP_RESULT_SECONDS:-3600}
+      # --- the polling trigger -------------------------------------------------
+      # Dormant unless every ZOHO_* value below is set to something that is not a placeholder.
+      POLL_MINUTES: ${POLL_MINUTES:-5}
+      POLL_FOLDER: ${POLL_FOLDER:-INBOX}
+      ZOHO_DC: ${ZOHO_DC:-}
+      ZOHO_ACCOUNT_ID: ${ZOHO_ACCOUNT_ID:-}
+      ZOHO_CLIENT_ID: ${ZOHO_CLIENT_ID:-}
+      ZOHO_CLIENT_SECRET: ${ZOHO_CLIENT_SECRET:-}
+      ZOHO_REFRESH_TOKEN: ${ZOHO_REFRESH_TOKEN:-}
+      ZOHO_FROM_ADDRESS: ${ZOHO_FROM_ADDRESS:-}
+      # --- the agent, identical to the gateway's -------------------------------
+      # The same budgets, so the job timeout is computed from the numbers the run actually uses.
+      AGENT_MAX_STEPS: ${AGENT_MAX_STEPS:-12}
+      AGENT_MAX_RETRIES_PER_TOOL: ${AGENT_MAX_RETRIES_PER_TOOL:-2}
+      AGENT_WALL_CLOCK_SECONDS: ${AGENT_WALL_CLOCK_SECONDS:-90}
+      MONI_MCP_ODOO_URL: ${MONI_MCP_ODOO_URL:-http://mcp-odoo:8011/mcp}
+      MONI_MCP_RAG_URL: ${MONI_MCP_RAG_URL:-http://mcp-rag:8012/mcp}
+      # `-` not `:-`, for the same reason the gateway uses it: empty must stay empty, and an empty URL
+      # is how the agent is told this server is not configured.
+      MONI_MCP_ZOHO_URL: ${MONI_MCP_ZOHO_URL-}
+      # Cloud egress, for a triggered run's B/C steps (§3.4). Same four names and the same reasoning
+      # as the gateway block: enumerated rather than inherited, and empty-stays-empty.
+      #
+      # This replaces a comment that said CLOUD_* was "deliberately NOT named here ... until a key
+      # exists". That was true when it was written and false as soon as a key was added — the exact
+      # shape of stale decision this file has already been bitten by once, which is why the condition
+      # is restated as a condition rather than left as a bare assertion of intent.
+      CLOUD_PROVIDER: ${CLOUD_PROVIDER:-}
+      CLOUD_BASE_URL: ${CLOUD_BASE_URL:-}
+      CLOUD_API_KEY: ${CLOUD_API_KEY:-}
+      CLOUD_MODEL: ${CLOUD_MODEL:-}
+      VLLM_BASE_URL: ${VLLM_BASE_URL_FOR_CONTAINERS:-http://host.docker.internal:8001/v1}
+      VLLM_API_KEY: ${VLLM_API_KEY:?VLLM_API_KEY must be set in .env (see .env.example)}
+      VLLM_MODEL: ${VLLM_MODEL:-corporate-main}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse:3000}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      # Per-user Odoo credentials, decrypted with the same key the gateway holds (§3.2, §3.11).
+      MONI_CRED_KEY: ${MONI_CRED_KEY:?MONI_CRED_KEY must be set in .env (see .env.example)}
+      ODOO_URL: ${ODOO_URL:?ODOO_URL must be set in .env (see .env.example)}
+      ODOO_DB: ${ODOO_DB:?ODOO_DB must be set in .env (see .env.example)}
+      # A triggered run raises an approval with no chat message behind it, so the worker mints the
+      # signed link itself (task 2.2b). Optional, like the gateway's: an empty key means the page
+      # answers 503 rather than the pause being unavailable.
+      MONI_APPROVAL_LINK_KEY: ${MONI_APPROVAL_LINK_KEY:-}
+      # --- the trigger's identity (task 2.6, §3.2) -----------------------------
+      # Who a triggered run acts as, and with which roles. `-` not `:-`: empty must stay empty, because
+      # "no subject" is a state the worker refuses to start in when a mailbox is configured
+      # (`moni_worker.wiring.validate_trigger_identity`) — substituting a default would hide exactly the
+      # misconfiguration that check exists to catch.
+      #
+      # These two were missing from this block until F3, and the omission is the *same class* as the
+      # CLOUD_* one above: a value documented in `.env.example`, present in `.env`, and never reaching
+      # the container. The smoke guard that caught the cloud case covered only the gateway's `Settings`
+      # aliases; `test_the_worker_trigger_variables_reach_the_container` now covers these.
+      TRIGGER_USER_SUB: ${TRIGGER_USER_SUB:-}
+      TRIGGER_ROLES: ${TRIGGER_ROLES:-}
+    extra_hosts:
+      # The local model usually lives on the host, so the container needs this alias — the same reason
+      # the gateway has it.
+      - "host.docker.internal:host-gateway"
+    networks:
+      - corporate-ai-net
+
+  # ---------------------------------------------------------------------------
+  # TEI — bge-m3 embeddings, used by both ingestion and retrieval.
+  #
+  # A service rather than a host endpoint reached through a portproxy. The vLLM pattern
+  # (`host.docker.internal` + a `netsh portproxy` rule) needs an elevated shell to install,
+  # and it makes the GPU host's TEI and a local one indistinguishable from inside the
+  # network. As a service, containers address it as `tei:80` and the host still reaches it
+  # on the loopback — no portproxy, no elevation, and `docker compose up` is enough.
+  #
+  # CPU, not GPU: the dev corpus is a handful of PDFs, and a local model means the RAG
+  # acceptance run does not depend on the GPU host being up. Production points
+  # EMBEDDINGS_BASE_URL at the server's corporate-embeddings host instead (§4); this
+  # service is not part of that deployment.
+  #
+  # No healthcheck on purpose. The first start downloads ~2 GB and loads the model, so any
+  # realistic probe would report "unhealthy" for minutes; and nothing depends on it *at
+  # startup* — the gateway and mcp-rag only reach it when a request needs an embedding, and
+  # both already degrade honestly when it is absent.
+  # ---------------------------------------------------------------------------
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    restart: unless-stopped
+    command: ["--model-id", "${EMBEDDINGS_MODEL:-BAAI/bge-m3}", "--port", "80"]
+    volumes:
+      # The downloaded model, so a restart is seconds instead of a re-download.
+      - teidata:/data
+    ports:
+      # 127.0.0.1 ONLY (§3.1). Containers use the service name and never this port.
+      - "127.0.0.1:${EMBEDDINGS_PORT:-8082}:80"
+    networks:
+      - corporate-ai-net
+
+  # ---------------------------------------------------------------------------
+  # nginx — the ONLY service reachable from outside the host. It serves the
+  # LibreChat fork at `/` (including the fork's own `/api/*` backend), proxies
+  # `/v1/` to the gateway verbatim, and exposes the gateway's `/auth/me` and
+  # `/health` as exact matches.
+  #
+  # `/api/` belongs to the UI, NOT to the gateway, and no prefix is stripped
+  # anywhere: the gateway's own routes are `/v1/...`, `/auth/me` and `/health`.
+  #
+  # Keycloak is reached directly on 127.0.0.1:${KEYCLOAK_PORT} and is deliberately
+  # NOT proxied here: identity is not part of the gateway's HTTP surface.
+  # ---------------------------------------------------------------------------
+  nginx:
+    image: nginx:stable
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+      ui:
+        # nginx serves the UI at `/`, so it must not come up before the UI does — a 502 on
+        # the front door is the first thing an operator sees otherwise.
+        condition: service_healthy
+      migrate:
+        # Belt and braces: nginx is what the acceptance check talks to, so it must
+        # not come up before the schema is applied.
+        condition: service_completed_successfully
+    environment:
+      NGINX_CLIENT_MAX_BODY_SIZE: ${NGINX_CLIENT_MAX_BODY_SIZE:-25m}
+    ports:
+      - "127.0.0.1:${NGINX_HTTP_PORT:-80}:80"
+    volumes:
+      # Mounted as a TEMPLATE, not into conf.d: the image entrypoint's
+      # 20-envsubst-on-templates.sh renders /etc/nginx/templates/*.template into
+      # /etc/nginx/conf.d/ with ${...} substituted from the environment. Mounting
+      # it directly at conf.d/default.conf leaves ${NGINX_CLIENT_MAX_BODY_SIZE}
+      # unsubstituted and nginx exits with "directive invalid value".
+      - ./nginx/dev.conf.template:/etc/nginx/templates/dev.conf.template:ro
+      - ./nginx/html:/usr/share/nginx/html:ro
+    healthcheck:
+      # The nginx:stable image ships curl but NOT wget, so use curl. This hits the
+      # dev index served from ./nginx/html, so it proves the static layer, not just
+      # that a process exists.
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - corporate-ai-net
+
+  # ---------------------------------------------------------------------------
+  # MONI AI UI — LibreChat fork (task 1.4).
+  #
+  # Built FROM THE SUBMODULE so the running UI is the pinned upstream tag (v0.8.7) rather
+  # than a floating `latest` image; the pin is the whole point of the fork discipline (§4).
+  # Everything MONI-specific is mounted in from infra/ui/, which is why `ui/` stays a
+  # pristine checkout with a clean `git status`. See docs/FORK_CHANGES.md.
+  #
+  # The UI never talks to Odoo, an MCP server or vLLM: its only upstream is the gateway
+  # (§3.1). That is enforced by the config (`baseURL` points at the gateway) and by this
+  # service having no other model endpoint configured.
+  # ---------------------------------------------------------------------------
+  ui:
+    build:
+      context: ../ui
+      dockerfile: Dockerfile.multi
+      target: api-build
+    restart: unless-stopped
+    depends_on:
+      ui-mongodb:
+        condition: service_healthy
+      ui-meilisearch:
+        condition: service_healthy
+      keycloak:
+        # OIDC discovery and the token exchange both need the realm up; without this the
+        # first login attempt races Keycloak's import and fails with an opaque 500.
+        condition: service_healthy
+    env_file:
+      # The container's own environment. Generated from infra/ui/ui.env.example (see
+      # docs/runbooks/ui.md); holds LibreChat's variable names unchanged.
+      - ../ui/.env
+    environment:
+      NODE_ENV: production
+    ports:
+      # Published on the loopback only (§3.1). nginx is the intended entry point — it
+      # serves `/` — so this port is a developer's direct-access route, not the front door.
+      - "127.0.0.1:${UI_PORT:-3080}:3080"
+    extra_hosts:
+      # Kept for parity with the gateway, so a future provider pointing at a host service
+      # behaves the same in both containers.
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # MONI overlay: config and branding. Read-only — the container must never mutate
+      # them, and a stray write would silently diverge the running UI from the repository.
+      - ./ui/librechat.yaml:/app/librechat.yaml:ro
+      - ./ui/logo.svg:/app/client/public/assets/moni-logo.svg:ro
+      # Writable state, on named volumes so `docker compose down` keeps conversations.
+      - uidata:/app/data
+      - uiimages:/app/client/public/images
+      - uiuploads:/app/uploads
+      - uilogs:/app/api/logs
+    healthcheck:
+      # No curl/wget in the alpine image, and Node 24 has global fetch, so the check uses
+      # the runtime already there. `/api/config` is LibreChat's unauthenticated
+      # startup-config endpoint: a 200 proves the express app loaded AND that the config
+      # file parsed — a malformed librechat.yaml fails startup, so this catches it.
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3080/api/config').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    networks:
+      - corporate-ai-net
+
+  ui-mongodb:
+    image: mongo:8.0.20
+    restart: unless-stopped
+    # NO published ports (§3.1): the conversation store is reachable only from the UI.
+    # Authentication IS on, unlike LibreChat's own deploy file (`mongod --noauth`): the UI
+    # shares a network with the gateway and the MCP servers, so an unauthenticated database
+    # would be readable by any of them.
+    command: ["mongod", "--bind_ip_all", "--quiet"]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: moni
+      MONGO_INITDB_ROOT_PASSWORD: ${UI_MONGO_PASSWORD:?UI_MONGO_PASSWORD must be set in .env (see .env.example)}
+    volumes:
+      - uimongodata:/data/db
+    healthcheck:
+      # $$ escapes the compose variable substitution so the shell expands them from the
+      # container's own environment (MONGO_INITDB_*), rather than compose trying to
+      # interpolate them from the host environment where they do not exist.
+      test:
+        [
+          "CMD-SHELL",
+          'mongosh --quiet --username "$$MONGO_INITDB_ROOT_USERNAME" --password "$$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --eval "db.adminCommand({ping:1}).ok" || exit 1',
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    networks:
+      - corporate-ai-net
+
+  ui-meilisearch:
+    image: getmeili/meilisearch:v1.35.1
+    restart: unless-stopped
+    # NO published ports (§3.1). Meilisearch is reached only by the UI over the compose
+    # network, so its master key never has to survive exposure to the host.
+    environment:
+      MEILI_NO_ANALYTICS: "true"
+      MEILI_MASTER_KEY: ${UI_MEILI_MASTER_KEY:?UI_MEILI_MASTER_KEY must be set in .env (see .env.example)}
+      MEILI_ENV: production
+    volumes:
+      - uimeilidata:/meili_data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - corporate-ai-net
+
+volumes:
+  # Named volumes: data survives `docker compose down` (use `down -v` to wipe).
+  pgdata:
+  redisdata:
+  keycloakdata:
+  langfuse_dbdata:
+  # The bge-m3 weights. Pinned to the name a standalone TEI container used, so an
+  # existing download is reused rather than fetched again on the first `up`.
+  teidata:
+    name: moni-tei-data
+  # UI stack (task 1.4). Separate volumes from the rest of the platform: the UI's own
+  # datastores hold conversations and search indexes, which are application data rather
+  # than platform state, and separating them makes "wipe the UI" one targeted command.
+  uimongodata:
+  uimeilidata:
+  uidata:
+  uiimages:
+  uiuploads:
+  uilogs:
+
+networks:
+  # Single shared network. `internal: true` would also block egress to the GPU
+  # host's vLLM/TEI endpoints, so egress stays enabled; isolation is achieved by
+  # the 127.0.0.1 port bindings above instead.
+  corporate-ai-net:
+    name: corporate-ai-net
+    driver: bridge

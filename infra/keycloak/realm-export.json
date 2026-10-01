@@ -1,0 +1,332 @@
+{
+  "realm": "moni",
+  "displayName": "MONI AI",
+  "displayNameHtml": "<strong>MONI AI</strong>",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "resetPasswordAllowed": false,
+  "rememberMe": false,
+  "verifyEmail": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": false,
+  "accessTokenLifespan": 900,
+  "ssoSessionIdleTimeout": 1800,
+  "ssoSessionMaxLifespan": 36000,
+  "roles": {
+    "realm": [
+      {
+        "name": "manager",
+        "description": "Sales/order manager",
+        "composite": false
+      },
+      {
+        "name": "warehouse",
+        "description": "Warehouse operator",
+        "composite": false
+      },
+      {
+        "name": "production",
+        "description": "Production planner",
+        "composite": false
+      },
+      {
+        "name": "accountant",
+        "description": "Accounting",
+        "composite": false
+      },
+      {
+        "name": "developer",
+        "description": "Software developer (DEV only)",
+        "composite": false
+      },
+      {
+        "name": "director",
+        "description": "Company director",
+        "composite": false
+      },
+      {
+        "name": "admin",
+        "description": "MONI AI administrator",
+        "composite": false
+      }
+    ],
+    "client": {}
+  },
+  "clients": [
+    {
+      "clientId": "moni-ui",
+      "name": "MONI AI UI (LibreChat fork)",
+      "description": "Browser client for the MONI AI UI. Public client with PKCE.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "bearerOnly": false,
+      "clientAuthenticatorType": "client-secret",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "consentRequired": false,
+      "fullScopeAllowed": true,
+      "frontchannelLogout": true,
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://127.0.0.1/*"
+      },
+      "redirectUris": [
+        "http://127.0.0.1/*"
+      ],
+      "webOrigins": [
+        "http://127.0.0.1",
+        "http://127.0.0.1:80"
+      ],
+      "protocolMappers": [
+        {
+          "name": "moni-gateway-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "moni-gateway",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "moni-ui-web",
+      "name": "MONI AI UI (LibreChat server-side OIDC)",
+      "description": "Confidential client for the LibreChat fork's authorization-code flow. The secret is injected at realm import from MONI_UI_WEB_CLIENT_SECRET.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "bearerOnly": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "${MONI_UI_WEB_CLIENT_SECRET}",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "consentRequired": false,
+      "fullScopeAllowed": true,
+      "frontchannelLogout": true,
+      "attributes": {
+        "post.logout.redirect.uris": "http://127.0.0.1/*"
+      },
+      "redirectUris": [
+        "http://127.0.0.1/oauth/openid/callback"
+      ],
+      "webOrigins": [
+        "http://127.0.0.1",
+        "http://127.0.0.1:80"
+      ],
+      "protocolMappers": [
+        {
+          "name": "moni-gateway-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "moni-gateway",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "moni-gateway",
+      "name": "MONI AI Gateway",
+      "description": "Bearer-only resource server. Validates tokens, never starts a flow.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "bearerOnly": true,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "consentRequired": false,
+      "fullScopeAllowed": true,
+      "attributes": {},
+      "redirectUris": [],
+      "webOrigins": []
+    }
+  ],
+  "users": [
+    {
+      "username": "manager",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Manager",
+      "lastName": "Test",
+      "email": "manager@moni.local",
+      "attributes": {
+        "moniRoleDescription": [
+          "Sales/order manager"
+        ]
+      },
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MONI_TEST_USER_PASSWORD}",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "manager"
+      ],
+      "requiredActions": []
+    },
+    {
+      "username": "warehouse",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Warehouse",
+      "lastName": "Test",
+      "email": "warehouse@moni.local",
+      "attributes": {
+        "moniRoleDescription": [
+          "Warehouse operator"
+        ]
+      },
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MONI_TEST_USER_PASSWORD}",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "warehouse"
+      ],
+      "requiredActions": []
+    },
+    {
+      "username": "production",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Production",
+      "lastName": "Test",
+      "email": "production@moni.local",
+      "attributes": {
+        "moniRoleDescription": [
+          "Production planner"
+        ]
+      },
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MONI_TEST_USER_PASSWORD}",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "production"
+      ],
+      "requiredActions": []
+    },
+    {
+      "username": "accountant",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Accountant",
+      "lastName": "Test",
+      "email": "accountant@moni.local",
+      "attributes": {
+        "moniRoleDescription": [
+          "Accounting"
+        ]
+      },
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MONI_TEST_USER_PASSWORD}",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "accountant"
+      ],
+      "requiredActions": []
+    },
+    {
+      "username": "developer",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Developer",
+      "lastName": "Test",
+      "email": "developer@moni.local",
+      "attributes": {
+        "moniRoleDescription": [
+          "Software developer (DEV only)"
+        ]
+      },
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MONI_TEST_USER_PASSWORD}",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "developer"
+      ],
+      "requiredActions": []
+    },
+    {
+      "username": "director",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Director",
+      "lastName": "Test",
+      "email": "director@moni.local",
+      "attributes": {
+        "moniRoleDescription": [
+          "Company director"
+        ]
+      },
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MONI_TEST_USER_PASSWORD}",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "director"
+      ],
+      "requiredActions": []
+    },
+    {
+      "username": "admin",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Admin",
+      "lastName": "Test",
+      "email": "admin@moni.local",
+      "attributes": {
+        "moniRoleDescription": [
+          "MONI AI administrator"
+        ]
+      },
+      "credentials": [
+        {
+          "type": "password",
+          "value": "${MONI_TEST_USER_PASSWORD}",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "admin"
+      ],
+      "requiredActions": []
+    }
+  ]
+}

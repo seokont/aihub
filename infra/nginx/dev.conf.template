@@ -1,0 +1,172 @@
+# MONI AI — nginx dev server configuration.
+#
+# Mounted read-only at /etc/nginx/templates/dev.conf.template. The nginx image
+# entrypoint's 20-envsubst-on-templates.sh renders it to
+# /etc/nginx/conf.d/dev.conf at container start, substituting ${...} from the
+# container environment. Mounting it straight into conf.d would NOT work: the
+# entrypoint only processes /etc/nginx/templates/, so the ${...} placeholder
+# would reach nginx verbatim and nginx would refuse to start.
+#
+# Only ${...} placeholders are substituted. nginx runtime variables ($host,
+# $scheme, $remote_addr, ...) are written without braces and pass through
+# untouched by design.
+#
+# ROUTING (task 1.4 — the UI becomes the front door):
+#
+#   /        -> ui        (LibreChat fork: the SPA and its own /api/* backend)
+#   /v1/     -> gateway   (the OpenAI-compatible surface LibreChat calls)
+#   /auth/me -> gateway   (identity debugging, used by the integration tests)
+#   /health  -> gateway   (liveness of the gateway itself; needs no token)
+#   /healthz -> nginx     (compose healthcheck)
+#   /approvals/ -> gateway (the human approval page; authenticated by the signed link itself)
+#
+# `/api/` now belongs to the UI, NOT to the gateway: LibreChat's own backend lives there
+# and the SPA calls it. This retires the Phase 0 dev index page as what a browser lands on.
+#
+# `/health` was `/api/health` until task 1.4 moved `/api/` to the UI, which left the
+# gateway's own health reachable only from inside the compose network — and the gateway
+# publishes no host port by design (§3.1), so nothing outside could check it. An exact-match
+# location restores that without shadowing anything the SPA owns.
+
+server {
+    # Sized for future vision intake (invoice photos, CLAUDE.md §7 Phase 3).
+    # Substituted from NGINX_CLIENT_MAX_BODY_SIZE (see .env.example).
+    client_max_body_size ${NGINX_CLIENT_MAX_BODY_SIZE};
+
+    # Dev listens on plain HTTP inside the container; the host binding is
+    # 127.0.0.1 only (CLAUDE.md §3.1). TLS termination is added with the real
+    # deployment configuration, not here.
+    listen 80 default_server;
+    server_name _;
+
+    # Do not advertise the exact nginx version.
+    server_tokens off;
+
+    access_log /dev/stdout;
+    error_log  /dev/stderr warn;
+
+    # Allow long-running agent runs and SSE streaming from the gateway.
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+    proxy_buffering off;
+
+    # Forward the real client identity downstream. Request headers are passed
+    # through unchanged, so the user's Keycloak JWT reaches the gateway unmodified
+    # (CLAUDE.md §3.2).
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host  $host;
+
+    # DNS for deferred upstream resolution. 127.0.0.11 is Docker's embedded DNS; a short
+    # TTL means a recreated container is picked up quickly.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+
+    # --- Gateway: the OpenAI-compatible surface -------------------------------
+    # LibreChat's custom endpoint calls http://gateway:8080/v1 directly over the compose
+    # network, so this route exists for parity and for debugging from the host. Proxied
+    # VERBATIM (no prefix strip) — the gateway's routes already are /v1/... .
+    location /v1/ {
+        set $gateway_v1 http://gateway:8080;
+        proxy_pass $gateway_v1;
+
+        # Streaming: buffering is already off server-wide; repeating it here keeps the
+        # guarantee local to the one location that depends on it, so a future change to the
+        # shared block cannot silently break SSE.
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_set_header Connection "";
+        proxy_read_timeout 300s;
+
+        # Only GET (models) and POST (completions) are meaningful.
+        limit_except GET POST { deny all; }
+    }
+
+    # --- Gateway: identity route ----------------------------------------------
+    # Kept on the gateway so an operator can verify what identity the gateway derives from
+    # a token without going through the UI. The integration tests use it too.
+    location = /auth/me {
+        set $gateway_auth http://gateway:8080;
+        proxy_pass $gateway_auth;
+    }
+
+    # --- Gateway: the approval page (task 2.2b) --------------------------------
+    # The link in an approval card opens here, and it must be reachable by a *browser* with no
+    # session: the signed token in the URL is the credential, not a header. It therefore cannot
+    # live under the UI's `location /` (LibreChat would 404 it) nor rely on the UI's JWT.
+    #
+    # Exact prefix, and before `location /`: a prefix location is chosen by longest match, so
+    # declaring it anywhere would win over `/`, but keeping it above makes the intent readable.
+    # Only GET (render the frozen call) and POST (decide) are meaningful.
+    location /approvals/ {
+        set $gateway_approvals http://gateway:8080;
+        proxy_pass $gateway_approvals;
+
+        # A decision is a one-shot state change; nothing here may be cached by an intermediary.
+        proxy_cache off;
+        limit_except GET POST { deny all; }
+    }
+
+    # --- Gateway: liveness ----------------------------------------------------
+    # The gateway's own /health, which reports the process and its dependencies rather than
+    # nginx's liveness. Unauthenticated by design, and an exact match so it cannot shadow
+    # anything under `location /`.
+    location = /health {
+        set $gateway_health http://gateway:8080;
+        proxy_pass $gateway_health;
+    }
+
+    # --- Gateway: the same liveness, at the path the acceptance harness asks for ---------------
+    # `verify.ps1` checks "nginx -> gateway" at `/api/health`, which without this block falls to
+    # `location /` — the UI's own Express backend, whose `/api/*` namespace answers
+    # `{"message":"Endpoint not found"}` with a 404. That made the harness permanently red, and a
+    # permanently red check is one nobody reads (ADR 0011's lesson, in nginx rather than in Alembic).
+    #
+    # An exact match that REWRITES to the gateway's existing `/health`, rather than the gateway
+    # growing a second alias: one endpoint, two paths, and the alias lives where the routing already
+    # lives. `/healthz` was the alternative and is the wrong one — LibreChat answers it with a bare
+    # `ok`, so a harness pointed there would assert the UI's liveness and would no longer be testing
+    # nginx -> gateway at all. Verified by body, not by assumption: `{"status":"ok"}` from the
+    # gateway, `ok` from the UI.
+    location = /api/health {
+        set $gateway_health_api http://gateway:8080/health;
+        proxy_pass $gateway_health_api;
+    }
+
+    # --- UI (LibreChat) -------------------------------------------------------
+    # `/` and everything the SPA owns, including its own /api/* backend. The UI reaches the
+    # gateway for model calls; it is never routed to an MCP server (§3.1).
+    location / {
+        set $ui_upstream http://ui:3080;
+        proxy_pass $ui_upstream;
+
+        # --- Default UI language: Ukrainian (§4) ------------------------------
+        # LibreChat resolves its language as: cookie `lang` -> localStorage ->
+        # navigator.language, and its SERVER reads the same cookie when rendering
+        # (api/server/index.js: `req.cookies.lang`). There is no DEFAULT_LOCALE setting, so
+        # the cookie is the only config-level way to make Ukrainian the default — and doing
+        # it here rather than editing the SPA is what keeps the fork pristine (§4).
+        #
+        # Only set when the browser has NOT already chosen: an existing `lang` cookie means
+        # the user picked a language in Settings, and overwriting it on every request would
+        # make that choice impossible to keep. `if` is used because `add_header` cannot test
+        # for an absent cookie.
+        #
+        # It must live inside a `location`: `add_header` is not permitted at server level,
+        # and nginx refuses to start ("add_header directive is not allowed here") — which is
+        # how this was first written and how it was caught.
+        if ($http_cookie !~* "(^|;\s*)lang=") {
+            add_header Set-Cookie "lang=uk; Path=/; SameSite=Lax" always;
+        }
+    }
+
+    # Health endpoint for the compose healthcheck and for external monitoring.
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+}

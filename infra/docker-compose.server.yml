@@ -1,0 +1,103 @@
+# MONI AI — server stand overlay.
+#
+# Applied ON TOP of the dev file, which stays the single description of what each service *is*:
+#
+#   docker compose --env-file .env \
+#     -f infra/docker-compose.dev.yml \
+#     -f infra/docker-compose.server.yml \
+#     up -d
+#
+# This overlay changes **topology only**. Every address still comes from `.env`, through the same
+# `*_FOR_CONTAINERS` variables the dev file already reads, so the two stands differ by environment
+# rather than by compose file:
+#
+#   VLLM_BASE_URL_FOR_CONTAINERS=http://corporate-llm:8000/v1
+#   EMBEDDINGS_BASE_URL_FOR_CONTAINERS=http://corporate-embeddings:80/v1
+#   ODOO_URL=http://192.168.1.211:8069          # the office LAN, over the host's VPN
+#   CORPORATE_LLM_NETWORK=<network corporate-llm and corporate-embeddings are attached to>
+#
+# WHAT THIS OVERLAY DOES
+#
+#   * joins the LLM stack's existing network, so `corporate-llm` and `corporate-embeddings`
+#     resolve. It is `external: true` on purpose: this stack attaches to that network, it does not
+#     create or own it, and Compose must fail loudly if the name is wrong rather than invent an
+#     empty network with the right name and then time out resolving the hostnames.
+#   * takes the local `tei` service out of a plain `up` — the server has real embeddings, and a CPU
+#     bge-m3 next to a GPU host is a confusing thing to leave running by accident. Opt in with
+#     `--profile local-embeddings` when you want it (offline work, a stack without the embeddings
+#     service).
+#   * pins `MONI_ENV` to a non-`dev` value on every service the dev file marks as `dev`.
+#
+#     This one is a safety property, not tidiness. `MONI_ENV=dev` is what tells the gateway that
+#     `change-me*` credentials are acceptable (`config.py`: `is_local_dev` is a literal
+#     `environment == "dev"`, default `"production"`), and the dev file hardcodes `dev` on
+#     `migrate`, `gateway`, `mcp-odoo`, `mcp-rag` and `ui`. Inheriting that on a server would
+#     silently disable the placeholder check — the failure mode being a stand that runs happily on
+#     the example credentials. A literal value is used rather than `${MONI_ENV:-server}` so it
+#     cannot be set back to `dev` by accident.
+#
+#     `ui` does not read it (the LibreChat fork is Node; the alias belongs to the Python settings),
+#     but it is overridden too: a merged config that still says `dev` anywhere is a signal a future
+#     reader will reasonably misread.
+#
+# WHAT THIS OVERLAY DELIBERATELY DOES NOT DO
+#
+#   * **TLS or public ingress.** The nginx template is plain HTTP and the dev file publishes it on
+#     the loopback only, so this overlay leaves the stack reachable from the server itself. A real
+#     deployment terminates TLS in front of it (CLAUDE.md §4: only 80/443 public) — that config
+#     does not exist yet and is not implied by using this file.
+#   * **Secrets management, backups, log shipping.**
+#   * **Anything about the VPN.** The route is not compose's business, but it is a real dependency:
+#     Odoo is reached over it, so the stand only works while the link is up. Verified on the server
+#     — a PPP-family VPN on `ppp0` (local `10.200.0.197`) routing the office LAN directly, from the
+#     host *and* from a container, so `ODOO_URL` needs no bridge. Check it with
+#     `ip route get 192.168.1.211` (want `dev ppp0`); when it is down the stack degrades to
+#     `odoo_unavailable` rather than failing. See the VPN section in README.md.
+
+services:
+  gateway:
+    environment:
+      MONI_ENV: server
+    # BOTH networks, listed in full. This service must keep reaching postgres, keycloak and the MCP
+    # servers on `corporate-ai-net` *and* gain `corporate-llm`; an override that named only one
+    # would either cut the stack in half or, worse, leave the gateway unable to resolve the model.
+    networks:
+      - corporate-ai-net
+      - llm-net
+
+  mcp-rag:
+    environment:
+      MONI_ENV: server
+    # Same reasoning: the corpus lives on `corporate-ai-net`, the embedding service on `llm-net`.
+    networks:
+      - corporate-ai-net
+      - llm-net
+
+  mcp-odoo:
+    environment:
+      MONI_ENV: server
+    # Deliberately no `networks:` key: Odoo is not on the LLM network. It is reached over the
+    # host's VPN route, so this service needs nothing beyond the base file's network.
+
+  migrate:
+    environment:
+      MONI_ENV: server
+
+  # Not a Python service, and it never reads the alias — overridden only so that no `dev` survives
+  # into the merged server config.
+  ui:
+    environment:
+      MONI_ENV: server
+
+  # The server uses the real embeddings service on the LLM network; the local CPU one stays
+  # available but out of the default `up`.
+  tei:
+    profiles: ["local-embeddings"]
+
+networks:
+  # The network `corporate-llm` and `corporate-embeddings` already live on. Required, with no
+  # default: the name is deployment data, and guessing it would produce either a network that
+  # Compose creates empty (and a hostname that never resolves) or a silent attach to the wrong one.
+  llm-net:
+    external: true
+    name: ${CORPORATE_LLM_NETWORK:?CORPORATE_LLM_NETWORK must be set in .env (see .env.example)}

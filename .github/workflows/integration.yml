@@ -1,0 +1,70 @@
+# Integration CI — the real stack, on demand or nightly.
+#
+# Not on every push: it pulls Keycloak, Postgres, Langfuse and builds the gateway image,
+# which is minutes of work for a signal that does not change between commits. Run it
+# manually from the Actions tab (`workflow_dispatch`) after touching infra/ or auth, and
+# nightly so drift is caught without a human remembering.
+
+name: Integration
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_stack:
+        description: Leave the stack running afterwards (for debugging on a self-hosted runner)
+        type: boolean
+        default: false
+  schedule:
+    # 03:00 UTC nightly.
+    - cron: "0 3 * * *"
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: compose up + auth round trip
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --all-packages --group dev
+
+      - name: Create .env from the template
+        # The stack is the dev stack, so the documented placeholders are the correct
+        # values here: nothing in CI holds a real credential (see ci.yml).
+        run: cp .env.example .env
+
+      - name: Start the stack (builds images, runs migrations, waits for health)
+        run: docker compose --env-file .env -f infra/docker-compose.dev.yml up -d --build --wait
+
+      - name: Show status
+        run: docker compose --env-file .env -f infra/docker-compose.dev.yml ps
+
+      - name: Migration revision must be 0001
+        run: |
+          docker compose --env-file .env -f infra/docker-compose.dev.yml \
+            run --rm --no-deps migrate alembic -c db/alembic.ini current | tee /tmp/alembic.txt
+          grep -q 0001 /tmp/alembic.txt
+
+      - name: Integration tests (Keycloak -> nginx -> gateway -> audit_log)
+        run: MONI_RUN_INTEGRATION=1 uv run --group dev pytest -m integration tests/integration -v
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose --env-file .env -f infra/docker-compose.dev.yml logs --no-color --tail 200
+
+      - name: Tear down
+        if: always() && (github.event_name != 'workflow_dispatch' || !inputs.keep_stack)
+        run: docker compose --env-file .env -f infra/docker-compose.dev.yml down -v

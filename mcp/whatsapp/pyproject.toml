@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moni-mcp-whatsapp"
+version = "0.1.0"
+description = "MONI AI whatsapp-mcp — message intake and approval-gated replies"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "pydantic>=2.9",
+]
+
+# Phase 3 adds: mcp, httpx. Inbound message bodies are untrusted external content
+# and level A (CLAUDE.md §3.4, §3.5).

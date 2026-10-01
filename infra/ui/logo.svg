@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MONI AI logo placeholder.
+
+  Deliberately a wordmark rather than an invented glyph: this file is a stand-in that
+  states its own status, so nobody mistakes it for a designed brand asset, and replacing
+  it is a one-file swap (see docs/runbooks/ui.md).
+
+  Mounted over the upstream /app/client/public/assets/logo.svg by
+  infra/docker-compose.dev.yml, which is why the submodule has no local modifications.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 64" width="240" height="64"
+     role="img" aria-label="MONI AI">
+  <rect width="240" height="64" rx="10" fill="#0f172a"/>
+  <text x="20" y="41" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+        font-size="26" font-weight="700" letter-spacing="1.5" fill="#f8fafc">MONI AI</text>
+  <text x="20" y="56" font-family="ui-sans-serif, system-ui, sans-serif"
+        font-size="9" letter-spacing="0.6" fill="#94a3b8">PLACEHOLDER LOGO</text>
+</svg>

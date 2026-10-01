@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moni-mcp-browser"
+version = "0.1.0"
+description = "MONI AI browser-mcp — sandboxed browser automation, approval-gated"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "pydantic>=2.9",
+]
+
+# Phase 3 adds: mcp, playwright. Runs in an isolated container with NO access to
+# the internal network (CLAUDE.md §3.5). This is the one service that will sit on
+# a separate egress-only network rather than corporate-ai-net.
