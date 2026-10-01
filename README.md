@@ -751,3 +751,5 @@ own RSA keypair. `.github/workflows/integration.yml` runs the full stack on dema
    (§3.4).
 5. Secrets only via env; unknown data level → treat as A, unknown action class →
    treat as irreversible (§3.11, §3.12).
+#   a i h u b  
+ 
