@@ -1,0 +1,64 @@
+diff --git a/api/strategies/openidStrategy.js b/api/strategies/openidStrategy.js
+index d9c2684..8b8f477 100644
+--- a/api/strategies/openidStrategy.js
++++ b/api/strategies/openidStrategy.js
+@@ -30,6 +30,14 @@ const { findUser, createUser, updateUser, findRolesByNames } = require('~/models
+ const { getAppConfig } = require('~/server/services/Config');
+ const getLogStores = require('~/cache/getLogStores');
+ 
++/**
++ * [MONI AI] `allowInsecureOidc` and `redirectOidcUrl` come from `./oidcOrigin`, shared with
++ * `openIdJwtStrategy.js` (which needs the redirect for `jwks-rsa` — that library fetches over
++ * its own HTTP client and never passes through `customFetch`). One implementation, so the
++ * two strategies cannot drift apart. See docs/FORK_CHANGES.md entry 0002.
++ */
++const { allowInsecureOidc, redirectOidcUrl } = require('./oidcOrigin');
++
+ /**
+  * @typedef {import('openid-client').ClientMetadata} ClientMetadata
+  * @typedef {import('openid-client').Configuration} Configuration
+@@ -71,7 +79,13 @@ async function customFetch(url, options) {
+       };
+     }
+ 
+-    const response = await undici.fetch(url, fetchOptions);
++    // [MONI AI] dev-only transport redirect: the identity stays the public issuer while the
++    // fetch goes to the container-reachable address. See redirectOidcUrl.
++    const redirectTarget = redirectOidcUrl(url);
++    const response = await undici.fetch(redirectTarget ?? url, fetchOptions);
++    if (redirectTarget) {
++      logger.debug(`[openidStrategy] ${url} -> ${redirectTarget}`);
++    }
+ 
+     if (debugOpenId) {
+       logger.debug(`[openidStrategy] Response status: ${response.status} ${response.statusText}`);
+@@ -937,14 +951,29 @@ async function setupOpenId() {
+       undefined,
+       {
+         [client.customFetch]: customFetch,
++        // [MONI AI] `execute` is openid-client's supported extension hook. Listing its own
++        // `allowInsecureRequests` here does two things at once, and BOTH are required:
++        // `discovery` reads `options.execute.includes(allowInsecureRequests)` to decide
++        // whether the discovery request itself may use http, and then calls each entry with
++        // the resulting Configuration, which clears the `tlsOnly` flag that every later
++        // request (token, JWKS, userinfo) is derived from. Omitting it is silent: discovery
++        // throws OAUTH_HTTP_REQUEST_FORBIDDEN and the strategy simply never registers.
++        ...(allowInsecureOidc ? { execute: [client.allowInsecureRequests] } : {}),
+       },
+     );
+ 
++    if (allowInsecureOidc) {
++      logger.warn(
++        '[openidStrategy] ALLOW_INSECURE_OIDC is active: a plain-HTTP OpenID issuer is permitted. This must never be enabled outside MONI_ENV=dev.',
++      );
++    }
++
+     logger.info(`[openidStrategy] OpenID authentication configuration`, {
+       usePKCE,
+       hasClientSecret: !!clientSecret,
+       tokenEndpointAuthMethod: clientMetadata.token_endpoint_auth_method ?? '(library default)',
+       generateNonce: shouldGenerateNonce,
++      allowInsecureOidc,
+     });
+ 
+     const openidLogin = new CustomOpenIDStrategy(

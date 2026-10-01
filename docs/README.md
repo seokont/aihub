@@ -39,6 +39,11 @@ the anonymizer, or the object storage backend for files.
 
 `runbooks/` holds:
 
+- [`server-deploy.md`](runbooks/server-deploy.md) — standing the stack up on a server, step by step.
+  **The required step that fails silently if it is skipped is applying the UI fork patches** (`make
+  ui-patches`): `ui/` is pinned at an upstream tag, so an unpatched submodule builds a UI that starts
+  healthy and fails at login with an opaque `500`. The runbook also lists what is still not
+  production-ready, including the dev-default Langfuse keys the template ships;
 - [`ui.md`](runbooks/ui.md) — operating the LibreChat fork;
 - [`zoho-mail.md`](runbooks/zoho-mail.md) — the mail tools: how to enable them (the `zoho` profile and
   the gateway rebuild), what each startup-refusal log line means, **where the `[moni-test]` drafts in

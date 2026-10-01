@@ -1,0 +1,140 @@
+diff --git a/api/strategies/openIdJwtStrategy.js b/api/strategies/openIdJwtStrategy.js
+index 14f50f3..58a4a2a 100644
+--- a/api/strategies/openIdJwtStrategy.js
++++ b/api/strategies/openIdJwtStrategy.js
+@@ -13,6 +13,8 @@ const {
+   math,
+ } = require('@librechat/api');
+ const { updateUser, findUser } = require('~/models');
++// [MONI AI] shared transport redirect; see the module for why both strategies need it.
++const { redirectOidcUrl } = require('./oidcOrigin');
+ 
+ const getOpenIdJwtAudience = () => {
+   const parsedAudience = (process.env.OPENID_AUDIENCE ?? '')
+@@ -27,6 +29,20 @@ const getOpenIdJwtAudience = () => {
+ 
+ const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+ 
++/**
++ * [MONI AI] Signing algorithms accepted for a Keycloak-issued bearer token.
++ *
++ * Defaults to RS256, which is what Keycloak uses. Configure with a space- or
++ * comma-separated `OPENID_JWT_ALGORITHMS` for a realm that signs differently.
++ */
++const getOpenIdJwtAlgorithms = () => {
++  const configured = (process.env.OPENID_JWT_ALGORITHMS ?? '')
++    .split(/[\s,]+/)
++    .map((value) => value.trim())
++    .filter(Boolean);
++  return configured.length > 0 ? configured : ['RS256'];
++};
++
+ const issuerMatchesTemplate = (expectedIssuer, actualIssuer) => {
+   if (!expectedIssuer.includes('{tenantid}')) {
+     return false;
+@@ -65,12 +81,19 @@ const isOpenIdIssuerAllowed = (payload, openIdConfig) => {
+  * This enables seamless migration for existing users when SharePoint integration is enabled.
+  */
+ const openIdJwtLogin = (openIdConfig) => {
++  const advertisedJwksUri = openIdConfig.serverMetadata().jwks_uri;
++  // [MONI AI] `jwks-rsa` resolves keys over its own HTTP client, so it never passes through
++  // openid-client's customFetch and the redirect in openidStrategy.js does not cover it.
++  // Without this the strategy is configured correctly, the token is valid, and key
++  // resolution silently fails against the container's own loopback address (127.0.0.1).
++  const jwksUri = redirectOidcUrl(advertisedJwksUri) ?? advertisedJwksUri;
++
+   let jwksRsaOptions = {
+     cache: process.env.OPENID_JWKS_URL_CACHE_ENABLED
+       ? isEnabled(process.env.OPENID_JWKS_URL_CACHE_ENABLED)
+       : true,
+     cacheMaxAge: math(process.env.OPENID_JWKS_URL_CACHE_TIME, 60000),
+-    jwksUri: openIdConfig.serverMetadata().jwks_uri,
++    jwksUri,
+   };
+ 
+   const requestAgent = getHttpsProxyAgent(jwksRsaOptions.jwksUri);
+@@ -78,11 +101,63 @@ const openIdJwtLogin = (openIdConfig) => {
+     jwksRsaOptions.requestAgent = requestAgent;
+   }
+ 
++  /**
++   * [MONI AI] Observable key resolution.
++   *
++   * `passport-jwt` reports every key-resolution failure as a bare 401 with no reason, and
++   * `requireJwtAuth` then falls through to the HS256 `jwt` strategy, whose "invalid
++   * algorithm" message is the only thing a caller ever sees. That message describes the
++   * FALLBACK, not this strategy, so a signature/audience/JWKS problem here is
++   * indistinguishable from an algorithm problem — which cost real debugging time.
++   *
++   * Wrapping the provider logs the true cause. It changes no behaviour: the same errors are
++   * raised, they are simply also recorded.
++   */
++  const jwksProvider = jwksRsa.passportJwtSecret(jwksRsaOptions);
++  const observableKeyProvider = (req, rawJwt, done) => {
++    jwksProvider(req, rawJwt, (err, key) => {
++      if (err) {
++        logger.warn(
++          `[openIdJwtLogin] signing key could not be resolved: ${err.message} ` +
++            `(jwksUri=${jwksRsaOptions.jwksUri})`,
++        );
++      }
++      done(err, key);
++    });
++  };
++
++  const expectedAudience = getOpenIdJwtAudience();
++  logger.info(
++    `[openIdJwtLogin] strategy configured: audience=${JSON.stringify(expectedAudience)} ` +
++      `algorithms=${JSON.stringify(getOpenIdJwtAlgorithms())} ` +
++      `jwksUri=${jwksUri}${jwksUri === advertisedJwksUri ? '' : ` (redirected from ${advertisedJwksUri})`}`,
++  );
++
+   return new JwtStrategy(
+     {
+       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+-      secretOrKeyProvider: jwksRsa.passportJwtSecret(jwksRsaOptions),
+-      audience: getOpenIdJwtAudience(),
++      secretOrKeyProvider: observableKeyProvider,
++      audience: expectedAudience,
++      /**
++       * [MONI AI] Pin the accepted signing algorithms to the realm's.
++       *
++       * `passport-jwt` passes `algorithms` straight through to `jsonwebtoken.verify`, and
++       * `jsonwebtoken` falls back to `['HS256','HS384','HS512']` when it is undefined. A
++       * Keycloak access token is RS256, so every such token was rejected with
++       * `{"message":"invalid algorithm"}` — and because `requireJwtAuth` tries the
++       * strategies in the order `['openidJwt','jwt']`, this strategy is consulted FIRST
++       * whenever OPENID_REUSE_TOKENS is enabled, so the failure was on the hot path for
++       * any client presenting a Keycloak token as its bearer credential.
++       *
++       * Naming the algorithm is also the security-correct thing to do: verifying against a
++       * JWKS while leaving the accepted algorithm unstated is how algorithm-confusion
++       * attacks are enabled. The gateway already pins its algorithms for the same reason
++       * (`moni_gateway.security.ALLOWED_ALGORITHMS`).
++       *
++       * Overridable for an IdP that signs with something else (ES256, PS256); the default
++       * matches Keycloak.
++       */
++      algorithms: getOpenIdJwtAlgorithms(),
+       passReqToCallback: true,
+     },
+     /**
+@@ -93,6 +168,10 @@ const openIdJwtLogin = (openIdConfig) => {
+     async (req, payload, done) => {
+       try {
+         if (!isOpenIdIssuerAllowed(payload, openIdConfig)) {
++          logger.warn(
++            `[openIdJwtLogin] rejected: issuer mismatch. token.iss=${payload?.iss} ` +
++              `expected=${openIdConfig.serverMetadata().issuer}`,
++          );
+           done(null, false, { message: 'Invalid issuer' });
+           return;
+         }
+@@ -167,6 +246,7 @@ const openIdJwtLogin = (openIdConfig) => {
+           done(null, false);
+         }
+       } catch (err) {
++        logger.error(`[openIdJwtLogin] verify callback threw: ${err?.message}`, err);
+         done(err, false);
+       }
+     },

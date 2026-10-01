@@ -20,8 +20,25 @@ A subtree would have avoided the `git init` that 1.4 needed, but at the cost of 
 LibreChat's entire history inside this repository — which is exactly the archaeology §4
 wants to avoid, in reverse. The submodule keeps our history about *our* system.
 
-**The fork currently has NO local modifications.** `git status` inside `ui/` is clean.
-Everything MONI-specific lives outside it, in `infra/ui/`, and is mounted in at runtime:
+**The fork HAS local modifications — entries 0002 and 0003 below — and they travel as a patch
+series.** This section used to claim `git status` inside `ui/` was clean; it was true when the
+integration model was decided and stopped being true when the OIDC work landed in 0002, so it is
+corrected here rather than left as a header that contradicts its own ledger.
+
+| | |
+| --- | --- |
+| Where the changes are | `infra/ui/patches/` — three patches, one per file, applied to the pinned checkout |
+| Applied by | `make ui-patches`, a prerequisite of `make up` (`scripts/apply_ui_patches.py`) |
+| Why patches, not a fork remote | `ui/`'s `origin` is upstream LibreChat, so the changes cannot be pushed there. Before the series existed they lived **only in the submodule's working tree**, and a fresh clone plus `git submodule update --init` silently produced an unpatched UI |
+| Regenerating after editing the fork by hand | see `infra/ui/patches/README.md` |
+
+The consequence to keep in mind when merging upstream: a `git checkout` **inside** `ui/` discards the
+patches, and the resulting UI starts healthy and fails at login with an opaque `500` — it does not fail
+to build. `tests/smoke/test_ui_patches.py` asserts the series is complete, that it touches only the
+paths named in this ledger, and that it applies cleanly to the pinned commit.
+
+Everything else MONI-specific still lives outside the submodule, in `infra/ui/`, and is mounted in at
+runtime:
 
 | What | Lives at | Mounted to |
 | --- | --- | --- |

@@ -27,7 +27,7 @@ INTEGRATION_ENV := MONI_RUN_INTEGRATION=1
 
 .PHONY: help sync up down restart logs ps migrate test test-unit test-integration test-odoo \
         lint fmt typecheck check audit check-env verify clean map-odoo-user remap-odoo-users \
-        list-odoo-users check-migrations
+        list-odoo-users check-migrations ui-patches
 
 help: ## show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -43,8 +43,18 @@ sync: ## install every workspace package + dev tools (--all-packages is required
 
 # --- stack -----------------------------------------------------------------
 
-up: ## start the dev stack (builds images, runs migrations, waits for health)
+up: ui-patches ## start the dev stack (builds images, runs migrations, waits for health)
 	$(COMPOSE) up -d --build --wait
+
+ui-patches: ## apply the recorded LibreChat fork touches to the ui submodule (idempotent)
+	# A prerequisite of `up`, not an optional extra: the ui service builds with `context: ../ui`,
+	# so a submodule that has not been patched produces a UI without the OIDC changes — it starts
+	# and looks healthy, and login fails for a reason nothing in the logs explains.
+	# `ui/` is pinned at an upstream tag, so the MONI changes travel as patches
+	# (infra/ui/patches/, see docs/FORK_CHANGES.md) rather than as a fork remote. Idempotent: a
+	# second run reports every patch as already applied, and a diverged tree fails loudly instead
+	# of silently skipping.
+	uv run --group dev python scripts/apply_ui_patches.py
 
 down: ## stop the stack, keep volumes
 	$(COMPOSE) down

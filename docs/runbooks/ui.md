@@ -172,6 +172,14 @@ The image is **built from the `ui/` submodule** (pinned upstream tag), not pulle
 change to the fork's code or to `librechat.yaml` needs a `build ui`; `librechat.yaml` and the
 logo are bind-mounted and only need `--force-recreate ui`.
 
+**The fork's own code changes are patches, not commits.** `ui/` points at an upstream LibreChat tag, so
+the MONI changes to `api/strategies/*` live in `infra/ui/patches/` and are applied by `make ui-patches`
+(a prerequisite of `make up`). Anything that touches the submodule's working tree can drop them —
+`git -C ui checkout`, `git -C ui stash`, a fresh `submodule update` — and the resulting UI builds,
+starts healthy, and fails at login with an opaque `500`. After any of those, run `make ui-patches` and
+rebuild. [`server-deploy.md`](server-deploy.md) has the full procedure; the series' own README explains
+how to regenerate a patch after editing the fork by hand.
+
 ## Login works but `/api/*` returns 401
 
 Two independent causes, both now fixed. If either regresses, the symptom is identical from

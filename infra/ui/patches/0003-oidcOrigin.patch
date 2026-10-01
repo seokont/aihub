@@ -1,0 +1,72 @@
+diff --git a/api/strategies/oidcOrigin.js b/api/strategies/oidcOrigin.js
+new file mode 100644
+index 0000000..d8f9183
+--- /dev/null
++++ b/api/strategies/oidcOrigin.js
+@@ -0,0 +1,66 @@
++/**
++ * [MONI AI] Redirect OIDC network fetches to a container-reachable address, WITHOUT changing
++ * the identity. See docs/FORK_CHANGES.md entry 0002.
++ *
++ * The problem is a name-resolution split, not an identity problem:
++ *
++ *   * the browser, the `iss` claim in Keycloak's responses, and every endpoint the discovery
++ *     document advertises use the PUBLIC issuer (KC_HOSTNAME, e.g.
++ *     http://127.0.0.1:8081/realms/moni);
++ *   * the UI container cannot reach that address — inside a container 127.0.0.1 is the
++ *     container itself — and must use the compose service name (http://keycloak:8080).
++ *
++ * So the identity stays public and only the transport is redirected. Responses are never
++ * rewritten, which is what keeps the discovery document, the expected `iss`, and the
++ * browser's redirect target all consistent.
++ *
++ * This lives in its own module because it is needed by two different fetch paths that do
++ * NOT share a client:
++ *
++ *   * `openidStrategy.js` — openid-client's customFetch (discovery, token, userinfo);
++ *   * `openIdJwtStrategy.js` — `jwks-rsa`, which resolves signing keys over its own HTTP
++ *     client and therefore never passes through customFetch.
++ *
++ * Missing the second one is silent and confusing: the strategy is configured correctly, the
++ * token is valid, and key resolution simply fails against the container's own loopback.
++ */
++
++/** Both variables must be present for a redirect to happen at all. */
++const publicIssuer = (process.env.OPENID_ISSUER || '').trim().replace(/\/+$/, '');
++const internalIssuer = (process.env.OPENID_INTERNAL_ISSUER || '').trim().replace(/\/+$/, '');
++
++/**
++ * Whether the dev-only relaxation is active.
++ *
++ * DOUBLE-gated: `ALLOW_INSECURE_OIDC` must be enabled AND `MONI_ENV` must be `dev`. Either
++ * alone is not enough, so a production deployment cannot acquire this behaviour by setting
++ * one stray variable. An `http://` issuer in production is a real vulnerability — the
++ * discovery document, token endpoint and JWKS are all unauthenticated.
++ */
++const allowInsecureOidc =
++  ['1', 'true', 'yes'].includes((process.env.ALLOW_INSECURE_OIDC || '').trim().toLowerCase()) &&
++  (process.env.MONI_ENV || '').trim().toLowerCase() === 'dev';
++
++/**
++ * Rewrite a URL's origin from the public issuer to the internal one.
++ *
++ * Returns `undefined` when no redirect applies, so callers can use `?? url` and leave
++ * everything else untouched. Only URLs under the expected public issuer are rewritten — a
++ * request aimed elsewhere (another host's userinfo endpoint, for instance) is never
++ * silently redirected to our Keycloak.
++ *
++ * @param {string | URL | undefined} url
++ * @returns {string | undefined} the redirected URL, or undefined to use the original
++ */
++function redirectOidcUrl(url) {
++  if (!allowInsecureOidc || !internalIssuer || !publicIssuer) {
++    return undefined;
++  }
++  const href = typeof url === 'string' ? url : url?.href;
++  if (!href || !href.startsWith(publicIssuer)) {
++    return undefined;
++  }
++  return internalIssuer + href.slice(publicIssuer.length);
++}
++
++module.exports = { allowInsecureOidc, redirectOidcUrl, publicIssuer, internalIssuer };
