@@ -100,6 +100,12 @@ class AgentState(TypedDict, total=False):
     limit_reason: str | None
     # The final user-facing answer.
     answer: str | None
+    # Why there is no answer, when there is none — see `graph.no_answer`. Written beside the answer
+    # rather than derived from it, because the message is user-facing prose and the reason has to be
+    # machine-readable: the server finding behind this field was a successful Odoo call whose answer
+    # said the data could not be fetched, and nothing in state, the trace or the audit row could say
+    # *why* the fallback had been used.
+    no_answer_reason: str | None
     # Bookkeeping for caps.
     step_count: int
     # The tool call frozen at the moment a human was asked about it (task 2.2).

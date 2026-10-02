@@ -334,6 +334,28 @@ def _with_model_calls(
     return record
 
 
+def _with_run_outcome(args: Mapping[str, Any], state: Mapping[str, Any]) -> dict[str, Any]:
+    """Add the run's own outcome facts to ``args_redacted`` (server finding, 2026-10-02).
+
+    ``no_answer_reason`` and ``limit_reason`` are what let an operator **find** these runs in SQL
+    rather than read the answer text and guess. The finding behind this was a run whose tool call
+    succeeded and whose answer said the data could not be fetched: the audit row recorded
+    ``result="ok"`` with no way to tell that the user had, in fact, been given no answer at all.
+
+    Kept out of ``result`` deliberately. ``result`` is a small vocabulary the UI and the audit queries
+    read (``ok``/``error``/``limit``/``awaiting_approval``), and widening it for a diagnostic would
+    change what existing queries mean. These are extra fields, so nothing that reads ``result`` today
+    sees a new value.
+    """
+    record = dict(args)
+    reason = state.get("no_answer_reason")
+    if reason:
+        record["no_answer_reason"] = reason
+    if state.get("limit_reason"):
+        record["limit_reason"] = state.get("limit_reason")
+    return record
+
+
 async def _authenticate(request: Request, credentials: BearerCredentials) -> Claims:
     """Verify the bearer token or reject. Shared by both routes."""
     token = credentials.credentials if credentials is not None else None
@@ -530,6 +552,10 @@ async def _run_once(
     # each model call went (task 2.4). Empty until the run returns, which is honest: a run that
     # died before its first model call made none.
     model_calls: list[dict[str, Any]] = []
+    # Bound before the `try` so the audit path can read the run's outcome facts on the *failure*
+    # branch too, where the run never returned a state. An empty mapping is the honest reading: a
+    # run that raised has no recorded reason for an absent answer beyond the error itself.
+    state: Mapping[str, Any] = {}
     tracer = tracer_for_run(request.app)
     try:
         policy, approvals = policy_clients_for(request.app)
@@ -584,7 +610,7 @@ async def _run_once(
                 subject=claims.sub,
                 result=result if failure is None else f"error: {failure}",
                 trace_id=trace_id,
-                args=_with_model_calls(args, model_calls),
+                args=_with_run_outcome(_with_model_calls(args, model_calls), state),
                 roles=list(claims.roles),
                 tools=tools,
             )
@@ -840,6 +866,9 @@ async def _stream_run(
     failure: str | None = None
     answer = ""
     model_calls: list[dict[str, Any]] = []
+    # Bound before the `try` for the same reason as `_run_once`: the audit path runs on the failure
+    # branch, where no state was ever returned.
+    state: Mapping[str, Any] = {}
     tracer = tracer_for_run(request.app)
     # The shared chunk builder: the same object the status stream uses, so the two paths cannot
     # drift into ending differently.
@@ -926,7 +955,7 @@ async def _stream_run(
                 subject=claims.sub,
                 result=result if failure is None else f"error: {failure}",
                 trace_id=trace_id,
-                args=_with_model_calls(args, model_calls),
+                args=_with_run_outcome(_with_model_calls(args, model_calls), state),
                 roles=list(claims.roles),
                 tools=tools,
             )

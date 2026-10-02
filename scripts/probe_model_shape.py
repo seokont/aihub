@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Probe an OpenAI-compatible model for the empty-completion fault (Step 0 of the `graph.py:1302` fix).
+
+**The question this answers.** A `respond` call in run `run-8802851d…` reported **243 completion
+tokens** and empty `content`, so the agent fell back to a template that blamed Odoo even though the tool
+call had succeeded. Two mechanisms produce that, and they need opposite fixes:
+
+* **H1 — reasoning-only completion.** The model puts its text in an analysis/reasoning channel and never
+  opens the final one. The answer would be *reading the other channel* or *changing the request*, and a
+  blind retry would reproduce it forever.
+* **H2 — truncation.** The generation is cut off before the final channel opens. Then the fix is the
+  token budget (`NODE_MAX_TOKENS["respond"]` is 2048), and a retry may legitimately help.
+
+This probe decides between them from `finish_reason`, the channels that actually came back, and how the
+outcome changes with the budget. It does **not** guess at request parameters: `--extra-json` exists so
+the operator can try whatever the served chat template accepts, instead of this script inventing flags.
+
+The payload mirrors the agent's real `respond` call: the same prompt files, the same message order, no
+tools. `--node` switches between the tool-free nodes.
+
+Usage::
+
+    uv run --group dev python scripts/probe_model_shape.py                       # 5 attempts
+    uv run --group dev python scripts/probe_model_shape.py --repeat 20
+    uv run --group dev python scripts/probe_model_shape.py --max-tokens 4096     # H2 test
+    uv run --group dev python scripts/probe_model_shape.py --evidence-file ev.txt
+    uv run --group dev python scripts/probe_model_shape.py --base-url http://corporate-llm:8000/v1
+
+Exit codes: 0 when every attempt produced usable text, 1 when any attempt did not (so it can gate a
+deploy check), 2 when the endpoint could not be reached at all.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+import httpx
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+PROMPTS = REPO_ROOT / "agent" / "src" / "moni_agent" / "prompts"
+
+#: The budget the agent actually uses per node (`graph.py::NODE_MAX_TOKENS`), so a bare run reproduces
+#: the production request rather than a friendlier one.
+NODE_MAX_TOKENS = {"plan": 3072, "act": 1024, "verify": 2048, "respond": 2048}
+
+#: A small, obviously-synthetic evidence block. It is labelled as a fixture inside the payload, because
+#: a probe that looks like production data is a probe somebody will mistake for one.
+SYNTHETIC_EVIDENCE = (
+    "PROBE FIXTURE — not real data.\n"
+    "get_my_tasks returned 43 tasks. First three: \n"
+    "- 42: «Перевірити S22714» (state: In Progress, deadline 2026-10-05)\n"
+    "- 43: «Підготувати звіт» (state: New, deadline none)\n"
+    "- 44: «Замовити матеріали» (state: Done, deadline 2026-09-30)\n"
+)
+
+QUESTION = "Які мої задачі?"
+
+
+def prompt_text(name: str) -> str:
+    path = PROMPTS / f"{name}.md"
+    if not path.is_file():
+        raise SystemExit(f"prompt file not found: {path}")
+    return path.read_text(encoding="utf-8")
+
+
+def build_payload(
+    *, model: str, node: str, max_tokens: int, evidence: str, extra: dict[str, object]
+) -> dict[str, object]:
+    """The same message order `_respond` builds, for the tool-free nodes."""
+    instruction = prompt_text(node)
+    payload: dict[str, object] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": prompt_text("system")},
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": QUESTION},
+            {"role": "assistant", "content": evidence},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "stream": False,
+    }
+    payload.update(extra)
+    return payload
+
+
+def classify(choice: dict[str, object]) -> tuple[str, dict[str, object]]:
+    """Name what came back, so H1 and H2 are distinguishable without reading prose."""
+    message = choice.get("message") or {}
+    if not isinstance(message, dict):
+        message = {}
+    content = message.get("content") or ""
+    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+    finish = choice.get("finish_reason")
+
+    facts: dict[str, object] = {
+        "finish_reason": finish,
+        "message_keys": sorted(message),
+        "content_len": len(content),
+        "reasoning_len": len(reasoning),
+        "tool_calls": len(message.get("tool_calls") or []),
+    }
+
+    if content.strip():
+        return "CONTENT_OK", facts
+    if reasoning.strip():
+        # The text exists, in a channel the router does not read. This is H1.
+        return "REASONING_ONLY", facts
+    if finish == "length":
+        # Cut off before anything usable was emitted. This is H2.
+        return "LENGTH_TRUNCATED", facts
+    return "NO_CHANNELS", facts
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="probe_model_shape", description=__doc__)
+    parser.add_argument("--node", default="respond", choices=sorted(NODE_MAX_TOKENS))
+    parser.add_argument(
+        "--repeat", type=int, default=5, help="attempts, to measure how often it fires"
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=None, help="default: the node's own budget"
+    )
+    parser.add_argument("--base-url", default=None, help="default: VLLM_BASE_URL")
+    parser.add_argument("--model", default=None, help="default: VLLM_MODEL")
+    parser.add_argument("--api-key", default=None, help="default: VLLM_API_KEY")
+    parser.add_argument(
+        "--evidence-file",
+        default=None,
+        help="use this file as the evidence block instead of the synthetic fixture (replay real data)",
+    )
+    parser.add_argument(
+        "--extra-json",
+        default=None,
+        help=(
+            "a JSON object merged into the request body, for trying served-template parameters "
+            '(e.g. \'{"chat_template_kwargs": {"reasoning_effort": "low"}}\'). This script does not '
+            "guess these for you."
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    base_url = (args.base_url or os.environ.get("VLLM_BASE_URL") or "").rstrip("/")
+    model = args.model or os.environ.get("VLLM_MODEL") or ""
+    api_key = args.api_key or os.environ.get("VLLM_API_KEY") or ""
+    if not base_url or not model:
+        raise SystemExit(
+            "VLLM_BASE_URL and VLLM_MODEL must be set (or passed as --base-url/--model)"
+        )
+
+    max_tokens = args.max_tokens or NODE_MAX_TOKENS[args.node]
+    evidence = (
+        Path(args.evidence_file).read_text(encoding="utf-8")
+        if args.evidence_file
+        else SYNTHETIC_EVIDENCE
+    )
+    extra: dict[str, object] = json.loads(args.extra_json) if args.extra_json else {}
+    payload = build_payload(
+        model=model, node=args.node, max_tokens=max_tokens, evidence=evidence, extra=extra
+    )
+
+    print(f"probe: {base_url}/chat/completions")
+    print(f"  model={model}  node={args.node}  max_tokens={max_tokens}  attempts={args.repeat}")
+    print(
+        f"  evidence: {'file ' + args.evidence_file if args.evidence_file else 'synthetic fixture'}"
+    )
+    if extra:
+        print(f"  extra body: {json.dumps(extra, ensure_ascii=False)}")
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    counts: dict[str, int] = {}
+    tokens: list[int] = []
+
+    with httpx.Client(timeout=120.0) as client:
+        for attempt in range(1, args.repeat + 1):
+            try:
+                response = client.post(
+                    f"{base_url}/chat/completions", headers=headers, json=payload
+                )
+            except httpx.HTTPError as exc:
+                print(f"\n  attempt {attempt}: endpoint unreachable: {type(exc).__name__}: {exc}")
+                if attempt == 1:
+                    print(
+                        "\nFAILED: cannot reach the model. On the server, check that the container's"
+                    )
+                    print("  VLLM_BASE_URL resolves (the host's 127.0.0.1 is not the container's).")
+                    return 2
+                continue
+
+            if response.status_code != 200:
+                print(f"\n  attempt {attempt}: HTTP {response.status_code}: {response.text[:400]}")
+                counts["HTTP_ERROR"] = counts.get("HTTP_ERROR", 0) + 1
+                continue
+
+            body = response.json()
+            choices = body.get("choices") or []
+            if not choices:
+                print(f"\n  attempt {attempt}: no choices in the response")
+                counts["NO_CHOICES"] = counts.get("NO_CHOICES", 0) + 1
+                continue
+
+            verdict, facts = classify(choices[0])
+            counts[verdict] = counts.get(verdict, 0) + 1
+            usage = body.get("usage") or {}
+            completion_tokens = int(usage.get("completion_tokens") or 0)
+            tokens.append(completion_tokens)
+            print(f"\n  attempt {attempt}: {verdict}")
+            print(f"    {json.dumps(facts, ensure_ascii=False)}")
+            print(f"    usage: prompt={usage.get('prompt_tokens')} completion={completion_tokens}")
+
+            content = (choices[0].get("message") or {}).get("content") or ""
+            reasoning = (choices[0].get("message") or {}).get("reasoning_content") or ""
+            if content.strip():
+                print(f"    content preview: {content.strip()[:200]!r}")
+            if reasoning:
+                print(f"    reasoning preview: {str(reasoning).strip()[:200]!r}")
+
+    print("\nsummary")
+    for verdict, count in sorted(counts.items()):
+        print(f"  {verdict:<18} {count}")
+    if tokens:
+        print(f"  completion tokens: min={min(tokens)} max={max(tokens)}")
+
+    print("\nreading")
+    if counts.get("REASONING_ONLY"):
+        print("  H1 is real: the text arrives in a reasoning channel the router does not read.")
+        print("  A blind retry would reproduce it. Fix the channel or the request parameters.")
+    if counts.get("LENGTH_TRUNCATED"):
+        print("  H2 is real: generations are being cut off. Retry or raise the budget.")
+    if counts.get("NO_CHANNELS") and not counts.get("REASONING_ONLY"):
+        print(
+            "  Neither channel carried text and it was not a truncation: suspect the served template"
+        )
+        print("  or the parser, and try --extra-json with the parameters that template documents.")
+
+    return 0 if set(counts) == {"CONTENT_OK"} else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

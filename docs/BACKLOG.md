@@ -403,3 +403,47 @@ that the audit's claim is broader than its check.
 **What must not change.** Do not blank the template's Langfuse pair to satisfy the check: the operator
 explicitly chose to ship working dev defaults, and a template that cannot bring the stack up on the
 first `compose up` is a worse trade than a documented local credential.
+
+---
+
+## 9. SCHEDULED — `toolbox_close_failed` is logged on every run
+
+**Status:** identified, scoped, deliberately separate. Opened by the operator on 2026-10-02 as a task of
+its own, explicitly *not* part of the `graph.py:1302` fix.
+
+**Where:** `agent/src/moni_agent/toolboxes.py` (`MultiToolBox.aclose`), and whatever calls it — the
+toolbox's owner in `moni_agent.mcp_tools`, the agent factory's `__aexit__`, and
+`gateway/src/moni_gateway/run_task.py`.
+
+**The symptom.** Every chat run logs
+
+```
+toolbox_close_failed  error=CancelledError
+```
+
+and sometimes `error=RuntimeError`. `aclose` catches `BaseException` per box **by design** — its
+docstring argues that a cancelled cleanup must not escape into the gateway's response generator, where
+it once turned a finished run into a 500 and a torn chunked body — so this warning is the swallow
+working, not a crash. Two things are still wrong:
+
+1. **It fires on every run**, so teardown is consistently happening under cancellation rather than
+   occasionally. `RunTask.stop()` **cancels** the task that owns the factory's lifetime (that is the
+   accepted 2.6 fix), so the factory's exit — and therefore this close — may be running while the task
+   is being cancelled. A session that never closes cleanly is a connection that outlives its run.
+2. **The line is unattributable.** It does not say which box failed, nor whether this was a cancellation
+   of an otherwise fine teardown or a real error. Every run producing the same one-liner is how a real
+   leak would hide.
+
+**Next concrete step.**
+
+1. A test that drives the factory/`RunTask` seam with a toolbox whose `aclose` records
+   `asyncio.current_task().cancelling()` and `sys.exc_info()`, asserting teardown is **not** cancelled.
+   That is the discriminating experiment; the hypothesis above is plausible and **unproven**.
+2. If teardown *is* being cancelled: decide whether to shield it or to cancel only after the exit has
+   run, and write the decision in `run_task.py`, whose docstring is where the lifetime argument lives.
+3. Either way, make the line attributable: name the box/server, and distinguish "cancelled during a
+   finished run" from "the close itself failed". Those are different events and today they are one
+   message.
+4. Collect first on a live stand: how often it is `CancelledError` versus `RuntimeError`, and whether it
+   differs between the interactive (gateway) and background (worker) paths.
+

@@ -57,6 +57,7 @@ class ScriptedAgent:
         error: Exception | None = None,
         model_calls: list[dict[str, Any]] | None = None,
         approval: dict[str, Any] | None = None,
+        no_answer_reason: str | None = None,
     ) -> None:
         self.answer = answer
         self.limit_reason = limit_reason
@@ -65,6 +66,10 @@ class ScriptedAgent:
         # gateway must treat the pause as a *result* rather than a failure — see the SSE test that
         # asserts the stream still terminates cleanly.
         self.approval = approval
+        # Why the run has no answer, when it has none (server finding, 2026-10-02). Carried through
+        # the real route code so the audit row's handling is exercised rather than asserted about a
+        # helper in isolation.
+        self.no_answer_reason = no_answer_reason
         # The per-step routing facts the real runner accumulates (task 2.4). Carried through the
         # same seam as everything else here, so the gateway's handling of them is exercised by the
         # shipped route code rather than asserted about a helper in isolation.
@@ -78,6 +83,7 @@ class ScriptedAgent:
         state: dict[str, Any] = {
             "answer": self.answer,
             "limit_reason": self.limit_reason,
+            "no_answer_reason": self.no_answer_reason,
             "steps_taken": [],
             "model_calls": [dict(call) for call in self.model_calls],
         }
@@ -452,6 +458,39 @@ async def test_a_capped_run_is_recorded_as_a_limit(
 
     assert response.status_code == 200
     assert audit_store.only(ACTION_RUN).result == "limit"
+
+
+async def test_the_run_outcome_reason_reaches_the_audit_row(
+    settings: Settings, signer: Signer, audit_store: RecordingAuditStore
+) -> None:
+    """A run that answered nothing must be findable in SQL (server finding, 2026-10-02).
+
+    The reported run recorded `result="ok"` — the tool call *had* succeeded — while the user was told
+    the Odoo data could not be fetched. Nothing in the row said so. The reason is carried as an extra
+    field rather than as a new `result` value, so no existing query changes meaning; what this test
+    pins is that the field is actually written, and written on the same row as the answer.
+    """
+    app = make_app(
+        settings,
+        signer,
+        audit_store,
+        agent=ScriptedAgent(
+            answer="Дані з Odoo отримано, але сформувати відповідь не вдалося: модель не повернула текст.",
+            no_answer_reason="model_returned_no_text",
+        ),
+    )
+
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://g") as client:
+            response = await client.post("/v1/chat/completions", headers=auth(signer), json=body())
+
+    assert response.status_code == 200
+    record = audit_store.only(ACTION_RUN)
+    assert record.args["no_answer_reason"] == "model_returned_no_text"
+    # The reason is diagnostic, not an outcome: the run did not error, and widening `result` would
+    # change what every existing audit query means.
+    assert record.result == "ok"
 
 
 async def test_a_failed_run_is_502_and_recorded_as_an_error(

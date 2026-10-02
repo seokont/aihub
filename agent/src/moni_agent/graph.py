@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Final
 
@@ -422,6 +423,22 @@ class AgentRunner:
             usage["input"] = result.prompt_tokens
         if result.completion_tokens is not None:
             usage["output"] = result.completion_tokens
+        if result.is_empty:
+            # A call that produced neither text nor a tool call. The router counts these for its
+            # escalation rule but nothing surfaced one, which is how a run whose answer said "cannot
+            # get data from Odoo" came to have an empty `respond` with no line anywhere saying so.
+            # `finish_reason` is the fact that separates the two candidate causes: a generation cut
+            # off at the budget versus one that emitted only a reasoning channel.
+            log.warning(
+                "model_returned_no_text",
+                trace_id=state.get("trace_id"),
+                node=node,
+                finish_reason=result.finish_reason,
+                completion_tokens=result.completion_tokens,
+                destination=result.destination,
+                level=result.level,
+            )
+
         self._tracer.generation(
             name=node,
             model=result.model or "unknown",
@@ -1027,12 +1044,21 @@ class AgentRunner:
 
         evidence = _evidence(state)
         calls: dict[str, Any] = {}
+        # What the final model call reported, recorded whether or not its answer was usable: "the
+        # model was asked and said nothing" is the case that produced the server finding, and
+        # `finish_reason` is what separates the two candidate causes behind it (a truncated
+        # generation versus one that emitted only a reasoning channel).
+        finish_reason: str | None = None
+        completion_tokens: int | None = None
+        reason: str | None = None
+
         if not _has_grounded_evidence(state):
             # Nothing was fetched successfully. Do not ask the model to summarise nothing:
             # an ungrounded summary is exactly where invented data appears, and a poisoned
             # prompt is designed to exploit it. Report the refusal or the empty result in
             # code instead.
-            answer = _no_evidence_answer(limit_reason, state)
+            outcome = _no_answer(limit_reason, state)
+            answer, reason = outcome.text, outcome.reason
         else:
             messages = [
                 SystemMessage(content=prompts.load("system")),
@@ -1042,10 +1068,50 @@ class AgentRunner:
             ]
             result = await self._ask(messages, [], node="respond", state=state)
             calls = self._calls(state, node="respond", result=result)
-            answer = (result.content or "").strip() or _no_evidence_answer(limit_reason, state)
+            finish_reason = result.finish_reason
+            completion_tokens = result.completion_tokens
+            answer = (result.content or "").strip()
+            if not answer:
+                # The reported bug lived here: a non-empty answer was assumed, so a blank completion
+                # fell through to a message that blamed Odoo for a failure that had not happened.
+                outcome = _no_answer(limit_reason, state, model_blank=True)
+                answer, reason = outcome.text, outcome.reason
 
-        self._tracer.node_span("respond", state, {"answer": answer[:500]})
-        return {**calls, "answer": answer, "limit_reason": limit_reason}
+        if reason is not None:
+            # One structured line per unattributed answer, so the next occurrence is diagnosable
+            # without re-reading this file — which is what the server finding cost.
+            steps = state.get("steps_taken") or []
+            log.warning(
+                "agent_no_answer",
+                trace_id=state.get("trace_id"),
+                reason=reason,
+                limit_reason=limit_reason,
+                model_blank=reason == NO_ANSWER_MODEL_RETURNED_NO_TEXT,
+                finish_reason=finish_reason,
+                completion_tokens=completion_tokens,
+                steps_ok=sum(1 for step in steps if step.get("ok")),
+                steps_failed=sum(1 for step in steps if not step.get("ok")),
+                evidence_chars=len(evidence),
+            )
+
+        self._tracer.node_span(
+            "respond",
+            state,
+            {
+                "answer": answer[:500],
+                # The reason belongs on the span: a trace has to answer "why is there no answer?"
+                # without a reader inferring it from the wording of the message.
+                "no_answer_reason": reason,
+                "finish_reason": finish_reason,
+                "completion_tokens": completion_tokens,
+            },
+        )
+        return {
+            **calls,
+            "answer": answer,
+            "limit_reason": limit_reason,
+            "no_answer_reason": reason,
+        }
 
     # -- helpers ------------------------------------------------------------
 
@@ -1268,39 +1334,118 @@ def _limit_notice(limit_reason: str) -> str:
     return f"⚠ Виконання зупинено ({limit_reason}); відповідь може бути неповною."
 
 
-def _no_evidence_answer(limit_reason: str | None, state: AgentState) -> str:
-    """The honest answer when no tool returned data — never delegated to the model.
+#: The reasons a run can end without an answer (server finding, 2026-10-02). A closed vocabulary
+#: rather than free text: the audit row, the trace and the log all carry one of these, and the whole
+#: point of the finding is that "no answer" was previously unattributable.
+NO_ANSWER_TOOL_ACCESS_REFUSED: Final = "tool_access_refused"
+NO_ANSWER_TOOL_FAILED: Final = "tool_failed"
+NO_ANSWER_LIMIT_REACHED: Final = "limit_reached"
+NO_ANSWER_MODEL_RETURNED_NO_TEXT: Final = "model_returned_no_text"
+NO_ANSWER_TOOL_RETURNED_NO_DATA: Final = "tool_returned_no_data"
+NO_ANSWER_NO_TOOLS_RAN: Final = "no_tools_ran"
 
-    A refusal is distinguished from an empty search, because "I have no access" and "there
-    is nothing to show" are different messages to the user.
+
+@dataclass(frozen=True)
+class _NoAnswer:
+    """A reason and the message for it, produced together so they cannot disagree."""
+
+    reason: str
+    text: str
+
+
+def _no_answer(
+    limit_reason: str | None, state: AgentState, *, model_blank: bool = False
+) -> _NoAnswer:
+    """Why the run has no answer, and the honest message for that reason.
+
+    **The server finding this exists for.** A run whose `get_my_tasks` call returned `ok: true` — the
+    trace shows the tool span succeeding and the step recorded — answered
+    "Не вдалося отримати дані з Odoo для цього запиту...". That was the last line of this function, and
+    it was reached because the *model* returned no text: the `respond` generation reported 243
+    completion tokens with an empty `content`. The data had been fetched; the message said it had not.
+    Four of the last twelve traces had the same shape.
+
+    Two paths reached that line and both meant something else:
+
+    * `_respond` (no grounded evidence) — no step succeeded, often because **no step ran** at all,
+      which is what a greeting produces;
+    * `_respond` (blank model answer) — evidence existed and the model **produced no text**.
+
+    **Reason and message are computed together, deliberately.** Two functions — one deciding the
+    reason, one the wording — would eventually disagree, and the disagreement would be exactly the bug
+    being fixed: a reason saying "model" under a message saying "data". A dataclass makes that
+    impossible rather than merely discouraged.
+
+    **Order is precedence, and it preserves the previous behaviour where that behaviour was right.** A
+    refusal outranks a failure, a failure outranks the cap (guarded by
+    `test_a_failed_fetch_outranks_the_cap_in_the_final_answer`), and the cap outranks a silent model.
+    Only the cases that previously fell through to the Odoo wording get new, accurate text.
+
+    Fail-closed is untouched: every branch is still written in code, and `_respond` still refuses to ask
+    the model to summarise nothing. This function decides *what the user is told*, never *whether an
+    answer may be invented*.
     """
+    steps = state.get("steps_taken") or []
+
     refusals = [
         step
-        for step in (state.get("steps_taken") or [])
+        for step in steps
         if not step.get("ok")
         and (step.get("error") or {}).get("code") in {"odoo_access_error", "tool_not_allowed"}
     ]
     if refusals:
-        return (
+        return _NoAnswer(
+            NO_ANSWER_TOOL_ACCESS_REFUSED,
             "У мене немає доступу до цих даних у Odoo, тому відповісти на запит я не можу. "
-            "Зверніться до адміністратора, якщо доступ потрібен."
+            "Зверніться до адміністратора, якщо доступ потрібен.",
         )
 
-    failures = [step for step in (state.get("steps_taken") or []) if not step.get("ok")]
+    failures = [step for step in steps if not step.get("ok")]
     if failures:
-        return (
+        return _NoAnswer(
+            NO_ANSWER_TOOL_FAILED,
             "Не вдалося отримати дані з Odoo: запит до інструментів завершився помилкою. "
-            "Відповіді на це запитання я надати не можу."
+            "Відповіді на це запитання я надати не можу.",
         )
 
     if limit_reason:
-        return (
+        # No longer claims the data was unreachable: when this is reached with successful steps, the
+        # run *did* fetch something and simply ran out of room. Claiming otherwise was the same class
+        # of falsehood as the reported bug, one branch higher up.
+        return _NoAnswer(
+            NO_ANSWER_LIMIT_REACHED,
             "Не вдалося завершити запит: досягнуто ліміт виконання "
-            f"({limit_reason}). Даних з Odoo отримати не вдалося."
+            f"({limit_reason}), тому відповідь може бути неповною.",
         )
-    return (
-        "Не вдалося отримати дані з Odoo для цього запиту, тому відповіді на нього "
-        "я надати не можу."
+
+    grounded = [step for step in steps if step.get("ok")]
+    if grounded and all(not step.get("result") for step in grounded):
+        # "The search ran and found nothing" is a real, grounded outcome, and it reads differently
+        # from "we could not reach Odoo".
+        #
+        # **Ordered above `model_blank` on purpose.** When every successful tool returned an empty
+        # payload *and* the model said nothing, both reasons are true and this one is the more
+        # specific: the model had nothing to work with. Putting it below `model_blank` would make it
+        # unreachable — `model_blank` is true in exactly that case — and an unreachable reason is a
+        # claim the code does not honour, which is the failure mode this whole finding is about.
+        return _NoAnswer(
+            NO_ANSWER_TOOL_RETURNED_NO_DATA,
+            "Запит виконано, але Odoo не повернув даних за цими умовами. Спробуйте уточнити запит.",
+        )
+
+    if model_blank:
+        # The case that produced the finding: the tools returned data (a non-empty payload) and the
+        # model said nothing.
+        return _NoAnswer(
+            NO_ANSWER_MODEL_RETURNED_NO_TEXT,
+            "Дані з Odoo отримано, але сформувати відповідь не вдалося: модель не повернула текст. "
+            "Спробуйте повторити запит.",
+        )
+
+    return _NoAnswer(
+        NO_ANSWER_NO_TOOLS_RAN,
+        "Не вдалося сформувати відповідь на це запитання: дані не запитувалися. "
+        "Спробуйте переформулювати запит.",
     )
 
 
