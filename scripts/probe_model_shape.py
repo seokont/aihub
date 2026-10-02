@@ -37,6 +37,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Final
 
 import httpx
 
@@ -59,6 +60,19 @@ SYNTHETIC_EVIDENCE = (
 
 QUESTION = "Які мої задачі?"
 
+#: One tool, declared so a variant can send a real assistant tool call followed by a real tool result.
+#: The served gpt-oss template renders `role: tool` into the `functions.<name> to=assistant`
+#: commentary channel, which is where tool output belongs — unlike an assistant turn, which it renders
+#: as the assistant's own *final* channel message.
+PROBE_TOOL: Final[dict[str, object]] = {
+    "type": "function",
+    "function": {
+        "name": "get_my_tasks",
+        "description": "List the calling user's Odoo tasks.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
 
 def prompt_text(name: str) -> str:
     path = PROMPTS / f"{name}.md"
@@ -67,7 +81,7 @@ def prompt_text(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def build_messages(variant: str, node: str, evidence: str) -> list[dict[str, str]]:
+def build_messages(variant: str, node: str, evidence: str) -> list[dict[str, object]]:
     """The messages for one single-variable shape (Step 1).
 
     Every variant differs from ``respond`` in **exactly one** respect, because the question is which
@@ -119,6 +133,44 @@ def build_messages(variant: str, node: str, evidence: str) -> list[dict[str, str
             {"role": "user", "content": f"{QUESTION}\n\n{evidence}"},
         ]
 
+    if variant == f"{node}-merged-evidence-as-user":
+        # BOTH fixes at once, and neither alone was enough to prove the combination:
+        #   * the node instruction merged into messages[0], because the served template reads only
+        #     `messages[0]` as an instruction and silently drops every later `system` role;
+        #   * the evidence in the user turn rather than a trailing assistant turn, which is the one
+        #     change that turned 0/5 into 5/5.
+        return [
+            {"role": "system", "content": f"{system}\n\n{instruction}"},
+            {"role": "user", "content": f"{QUESTION}\n\n{evidence}"},
+        ]
+
+    if variant == f"{node}-merged-tool-turn":
+        # The same instruction placement, but the evidence as a REAL tool result: an assistant turn
+        # carrying the tool call, then `role: tool` answering it. The template renders that into the
+        # commentary channel, which is where tool output belongs — and it keeps untrusted tool text
+        # out of the *user* turn, which matters for the untrusted-content rule.
+        return [
+            {"role": "system", "content": f"{system}\n\n{instruction}"},
+            {"role": "user", "content": QUESTION},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_probe",
+                        "type": "function",
+                        "function": {"name": "get_my_tasks", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_probe",
+                "name": "get_my_tasks",
+                "content": evidence,
+            },
+        ]
+
     if variant == f"{node}-answer-only":
         # Does an explicit instruction to skip the analysis channel change anything?
         return [
@@ -150,6 +202,8 @@ def variants_for(node: str) -> tuple[str, ...]:
         f"{node}-one-system",
         f"{node}-no-system",
         f"{node}-answer-only",
+        f"{node}-merged-evidence-as-user",
+        f"{node}-merged-tool-turn",
         "plain",
     )
 
@@ -171,6 +225,8 @@ def build_payload(
         "temperature": 0,
         "stream": False,
     }
+    if variant and variant.endswith("-merged-tool-turn"):
+        payload["tools"] = [PROBE_TOOL]
     payload.update(extra)
     return payload
 
@@ -287,9 +343,11 @@ def main(argv: list[str] | None = None) -> int:
         # `payload["messages"]` is typed `object` because the body is a plain dict for the wire; the
         # annotation here is what lets mypy follow it, rather than an ignore that would hide a real
         # change of shape.
-        sent: list[dict[str, str]] = payload["messages"]  # type: ignore[assignment]
+        sent: list[dict[str, object]] = payload["messages"]  # type: ignore[assignment]
         for index, message in enumerate(sent):
-            body = message.get("content", "")
+            # `str` because `content` may legitimately be absent or empty (the assistant turn that
+            # carries only a tool call), so this is a display of whatever is there, not an assertion.
+            body = str(message.get("content") or "")
             print(f"  [{index}] {message.get('role')}: {len(body)} chars")
             print(f"      {body[:400]!r}")
         print()
@@ -345,7 +403,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    usage: prompt={usage.get('prompt_tokens')} completion={completion_tokens}")
 
             content = (choices[0].get("message") or {}).get("content") or ""
-            reasoning = (choices[0].get("message") or {}).get("reasoning_content") or ""
+            message = choices[0].get("message") or {}
+            # Both spellings, in the same order `classify` uses. Reading only `reasoning_content`
+            # silently printed nothing against vLLM 0.28.0, whose openai_gptoss parser names the
+            # analysis channel `reasoning` — so the dump this step exists for produced no output.
+            reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
             if content.strip():
                 print(f"    content preview: {content.strip()[:200]!r}")
             if reasoning:
