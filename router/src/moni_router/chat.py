@@ -26,6 +26,7 @@ import asyncio
 import os
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import replace
+from types import MappingProxyType
 from typing import Any, Final
 
 import httpx
@@ -56,6 +57,15 @@ from moni_router.wire import (
 )
 
 log = structlog.get_logger(__name__)
+
+#: Request-body fields that **only the local vLLM server accepts** (Step 2 of the empty-`respond`
+#: finding). Empty until a parameter is proven to fix the fault, and deliberately empty rather than
+#: speculative: every field here is a claim about what vLLM accepts, and a wrong one breaks the local
+#: path — which is also the degraded fallback when the cloud fails.
+#:
+#: The cloud call sites in `provider.py` never pass this, so a field added here cannot reach a hosted
+#: provider. `tests/unit/router/test_local_only_body.py` holds that down in both directions.
+LOCAL_ONLY_BODY: Final[Mapping[str, Any]] = MappingProxyType({})
 
 #: Attempts for one **local** model call, the first included. A transient 5xx is re-sampled instead
 #: of failing the whole run.
@@ -292,7 +302,14 @@ async def _local_chat(
     """One call to the local model, with the bounded 5xx retry."""
     base_url, api_key, model = resolve_settings(env)
     body = build_payload(
-        messages, tools, model, temperature=temperature, max_tokens=max_tokens, stream=False
+        messages,
+        tools,
+        model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        stream=False,
+        # Local-only fields never reach the cloud (see `LOCAL_ONLY_BODY`).
+        local_only=LOCAL_ONLY_BODY,
     )
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
@@ -424,7 +441,14 @@ async def _local_stream(
     """The local streaming call, with the bounded retry up to the first status line."""
     base_url, api_key, model = resolve_settings(env)
     body = build_payload(
-        messages, tools, model, temperature=temperature, max_tokens=max_tokens, stream=True
+        messages,
+        tools,
+        model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        stream=True,
+        # Local-only fields never reach the cloud (see `LOCAL_ONLY_BODY`).
+        local_only=LOCAL_ONLY_BODY,
     )
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 

@@ -102,6 +102,19 @@ class ChatResult(BaseModel):
     model: str | None = None
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    #: How many characters arrived on a model's **reasoning/analysis** channel — never the text itself.
+    #:
+    #: gpt-oss served with ``--reasoning-parser openai_gptoss`` splits its generation into an analysis
+    #: channel and a final one, and the router reads only ``content`` — so a completion can report real
+    #: ``completion_tokens`` with empty content (server finding, 2026-10-02: 10/10 attempts on the real
+    #: ``respond`` shape came back ``finish_reason=stop`` with 65-66 tokens and ``content_len=0``).
+    #:
+    #: The **length** is recorded; the text deliberately is not. Reasoning is the model's internals and
+    #: the trace is read by operators, and the only thing needed to tell "the model stopped after its
+    #: analysis" from "the model said nothing at all" is whether that channel was populated. Recording
+    #: the text would place internal deliberation wherever user-facing output goes, from where it may
+    #: eventually be shown — the exact outcome the operator ruled out in advance.
+    reasoning_chars: int = 0
 
     # -- routing facts (task 2.4, §3.4/§3.8) ---------------------------------
     #

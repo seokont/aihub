@@ -23,7 +23,7 @@ No provider, no policy and no endpoint address is named here: this module is pur
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any, Final
 
 import structlog
@@ -127,8 +127,20 @@ def build_payload(
     temperature: float,
     max_tokens: int,
     stream: bool,
+    local_only: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """The request body for ``POST /chat/completions``."""
+    """The request body for ``POST /chat/completions``.
+
+    **This builder is shared by the local and the cloud path, which is a trap.** A field added here
+    unconditionally reaches both, and the two servers document different fields: vLLM accepts things a
+    hosted provider does not, and an unknown key is at best ignored and at worst a 400 — on the path
+    that is already the fallback when the local model fails.
+
+    ``local_only`` is how a field reaches the local server and no other. It is a **parameter rather
+    than a module constant** so that the decision belongs to the caller that knows the destination,
+    and the cloud call sites simply do not pass it (`tests/unit/router/test_local_only_body.py` asserts
+    that a field passed here arrives locally and never at the cloud).
+    """
     body: dict[str, Any] = {
         "model": model,
         "messages": to_wire_messages(messages),
@@ -140,6 +152,8 @@ def build_payload(
         # Tool choice is left to the model: the graph decides when to stop, not the
         # request, so a plan can also be a plain answer.
         body["tools"] = [tool.to_openai_schema() for tool in tools]
+    if local_only:
+        body.update(dict(local_only))
     return body
 
 
@@ -191,6 +205,10 @@ def parse_completion(payload: Any, *, fallback_model: str) -> ChatResult:
     choice = choices[0] if isinstance(choices[0], dict) else {}
     message = choice.get("message") or {}
     usage = payload.get("usage") or {}
+    # The reasoning/analysis channel, measured but never kept (see `ChatResult.reasoning_chars`). Its
+    # length is what distinguishes "the model stopped after thinking" from "the model said nothing",
+    # and that distinction is the whole diagnosis of the empty-`respond` finding.
+    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
     return ChatResult(
         content=message.get("content"),
         tool_calls=parse_tool_calls(message.get("tool_calls")),
@@ -198,6 +216,7 @@ def parse_completion(payload: Any, *, fallback_model: str) -> ChatResult:
         model=payload.get("model") or fallback_model,
         prompt_tokens=usage.get("prompt_tokens"),
         completion_tokens=usage.get("completion_tokens"),
+        reasoning_chars=len(str(reasoning)),
     )
 
 

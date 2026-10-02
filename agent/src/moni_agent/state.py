@@ -98,6 +98,12 @@ class AgentState(TypedDict, total=False):
     findings: list[str]
     # Set when a cap tripped or the loop could not satisfy the request.
     limit_reason: str | None
+    # Why the loop stopped early when it was **not** a cap: a `plan` or `verify` that returned no text
+    # at all (server finding, 2026-10-02). Separate from `limit_reason` because a cap and a silent
+    # model are different facts, and conflating them is what produced the misleading answer this field
+    # exists to prevent. Written by the node that discovers it — a conditional-edge function returns a
+    # path, not a state update, so routing cannot record it.
+    stopped_reason: str | None
     # The final user-facing answer.
     answer: str | None
     # Why there is no answer, when there is none — see `graph.no_answer`. Written beside the answer

@@ -67,19 +67,106 @@ def prompt_text(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def build_payload(
-    *, model: str, node: str, max_tokens: int, evidence: str, extra: dict[str, object]
-) -> dict[str, object]:
-    """The same message order `_respond` builds, for the tool-free nodes."""
+def build_messages(variant: str, node: str, evidence: str) -> list[dict[str, str]]:
+    """The messages for one single-variable shape (Step 1).
+
+    Every variant differs from ``respond`` in **exactly one** respect, because the question is which
+    single change makes the model use its final channel instead of stopping after the analysis one.
+    Two changes at once would answer nothing.
+
+    ``respond`` and ``verify`` are the two nodes that end their prompt with an **assistant** turn, and
+    ``plan`` is the one that sends **two system messages** — those are the structural suspects, and the
+    variants exist to separate them.
+    """
+    system = prompt_text("system")
     instruction = prompt_text(node)
-    payload: dict[str, object] = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": prompt_text("system")},
+
+    if variant == "plain":
+        # The control that is known to work: no agent prompts at all.
+        return [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": QUESTION},
+        ]
+
+    if variant == f"{node}-no-system":
+        return [
             {"role": "system", "content": instruction},
             {"role": "user", "content": QUESTION},
             {"role": "assistant", "content": evidence},
-        ],
+        ]
+
+    if variant == f"{node}-one-system":
+        # One system message instead of two: some templates concatenate, some do not.
+        return [
+            {"role": "system", "content": f"{system}\n\n{instruction}"},
+            {"role": "user", "content": QUESTION},
+            {"role": "assistant", "content": evidence},
+        ]
+
+    if variant == f"{node}-no-evidence":
+        # Drop the trailing assistant turn — the shape suspect for respond/verify.
+        return [
+            {"role": "system", "content": system},
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": QUESTION},
+        ]
+
+    if variant == f"{node}-evidence-as-user":
+        # The evidence as a *user* turn: same information, no trailing assistant turn.
+        return [
+            {"role": "system", "content": system},
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": f"{QUESTION}\n\n{evidence}"},
+        ]
+
+    if variant == f"{node}-answer-only":
+        # Does an explicit instruction to skip the analysis channel change anything?
+        return [
+            {"role": "system", "content": system},
+            {"role": "system", "content": instruction},
+            {"role": "user", "content": QUESTION},
+            {"role": "assistant", "content": evidence},
+            {
+                "role": "system",
+                "content": "Reply with the final answer only. Do not use the analysis channel.",
+            },
+        ]
+
+    # Baseline: byte-identical to what the agent's node builds.
+    return [
+        {"role": "system", "content": system},
+        {"role": "system", "content": instruction},
+        {"role": "user", "content": QUESTION},
+        {"role": "assistant", "content": evidence},
+    ]
+
+
+def variants_for(node: str) -> tuple[str, ...]:
+    """The variant names offered for a node, so `--help`-level discovery is not guesswork."""
+    return (
+        node,
+        f"{node}-no-evidence",
+        f"{node}-evidence-as-user",
+        f"{node}-one-system",
+        f"{node}-no-system",
+        f"{node}-answer-only",
+        "plain",
+    )
+
+
+def build_payload(
+    *,
+    model: str,
+    node: str,
+    max_tokens: int,
+    evidence: str,
+    extra: dict[str, object],
+    variant: str | None = None,
+) -> dict[str, object]:
+    """The request body for one node, in the chosen message shape."""
+    payload: dict[str, object] = {
+        "model": model,
+        "messages": build_messages(variant or node, node, evidence),
         "max_tokens": max_tokens,
         "temperature": 0,
         "stream": False,
@@ -134,6 +221,27 @@ def main(argv: list[str] | None = None) -> int:
         help="use this file as the evidence block instead of the synthetic fixture (replay real data)",
     )
     parser.add_argument(
+        "--variant",
+        default=None,
+        help=(
+            "ONE single-variable message shape (Step 1). Default: the node's real shape. Choices for "
+            "--node respond are: " + ", ".join(variants_for("respond"))
+        ),
+    )
+    parser.add_argument(
+        "--dump-reasoning",
+        action="store_true",
+        help=(
+            "print the reasoning channel in full. With the openai_gptoss parser that channel IS the "
+            "analysis, so reading it is what decides whether it may ever be shown to a user (Step 3)"
+        ),
+    )
+    parser.add_argument(
+        "--dump-prompt",
+        action="store_true",
+        help="print the exact messages sent, so 'which prompt produced this' is never inference",
+    )
+    parser.add_argument(
         "--extra-json",
         default=None,
         help=(
@@ -159,12 +267,36 @@ def main(argv: list[str] | None = None) -> int:
         else SYNTHETIC_EVIDENCE
     )
     extra: dict[str, object] = json.loads(args.extra_json) if args.extra_json else {}
+    variant = args.variant or args.node
+    if variant not in variants_for(args.node):
+        raise SystemExit(
+            f"unknown --variant {variant!r} for --node {args.node}. "
+            f"Choices: {', '.join(variants_for(args.node))}"
+        )
     payload = build_payload(
-        model=model, node=args.node, max_tokens=max_tokens, evidence=evidence, extra=extra
+        model=model,
+        node=args.node,
+        max_tokens=max_tokens,
+        evidence=evidence,
+        extra=extra,
+        variant=variant,
     )
 
+    if args.dump_prompt:
+        print("messages sent:")
+        # `payload["messages"]` is typed `object` because the body is a plain dict for the wire; the
+        # annotation here is what lets mypy follow it, rather than an ignore that would hide a real
+        # change of shape.
+        sent: list[dict[str, str]] = payload["messages"]  # type: ignore[assignment]
+        for index, message in enumerate(sent):
+            body = message.get("content", "")
+            print(f"  [{index}] {message.get('role')}: {len(body)} chars")
+            print(f"      {body[:400]!r}")
+        print()
+
     print(f"probe: {base_url}/chat/completions")
-    print(f"  model={model}  node={args.node}  max_tokens={max_tokens}  attempts={args.repeat}")
+    print(f"  model={model}  node={args.node}  variant={variant}  max_tokens={max_tokens}")
+    print(f"  attempts={args.repeat}")
     print(
         f"  evidence: {'file ' + args.evidence_file if args.evidence_file else 'synthetic fixture'}"
     )
@@ -217,7 +349,20 @@ def main(argv: list[str] | None = None) -> int:
             if content.strip():
                 print(f"    content preview: {content.strip()[:200]!r}")
             if reasoning:
-                print(f"    reasoning preview: {str(reasoning).strip()[:200]!r}")
+                if args.dump_reasoning:
+                    # Printed in full and *not* summarised: the Step 3 verdict turns on whether this
+                    # text is the model's answer or its analysis, and a 200-char preview is exactly
+                    # the thing that would hide the difference.
+                    print(f"    reasoning (full, {len(str(reasoning))} chars):")
+                    print(f"      {str(reasoning).strip()!r}")
+                else:
+                    print(f"    reasoning preview: {str(reasoning).strip()[:200]!r}")
+
+    if not counts:
+        # Nothing was attempted. With --dump-prompt that is a deliberate inspection run; without it,
+        # `--repeat 0` is a mistake worth a non-zero exit rather than a silent success.
+        print("\nno attempts were made (--repeat 0)")
+        return 0 if args.dump_prompt else 2
 
     print("\nsummary")
     for verdict, count in sorted(counts.items()):
@@ -229,6 +374,9 @@ def main(argv: list[str] | None = None) -> int:
     if counts.get("REASONING_ONLY"):
         print("  H1 is real: the text arrives in a reasoning channel the router does not read.")
         print("  A blind retry would reproduce it. Fix the channel or the request parameters.")
+        if args.dump_reasoning:
+            print("  Read the dump above and decide: is that text the ANSWER or the ANALYSIS?")
+            print("  The Step 3 verdict depends on it, and it must be recorded either way.")
     if counts.get("LENGTH_TRUNCATED"):
         print("  H2 is real: generations are being cut off. Retry or raise the budget.")
     if counts.get("NO_CHANNELS") and not counts.get("REASONING_ONLY"):

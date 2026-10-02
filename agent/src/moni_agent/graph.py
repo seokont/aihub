@@ -347,7 +347,13 @@ class AgentRunner:
         builder.add_node("respond", self._respond)
 
         builder.add_edge(START, "plan")
-        builder.add_edge("plan", "act")
+        # Conditional, not a plain edge: a blank plan must stop the run rather than send `act` after
+        # an instruction nobody wrote (server finding, 2026-10-02).
+        builder.add_conditional_edges(
+            "plan",
+            self._after_plan,
+            {"act": "act", "respond": "respond"},
+        )
         # A run that has asked a human for permission must stop, not proceed. `act` returns
         # normally with `pending_approval` set (it cannot interrupt itself ? see the note in
         # state.py), and this edge is what turns that into a pause.
@@ -474,7 +480,27 @@ class AgentRunner:
         ]
         result = await self._ask(messages, [], node="plan", state=state)
         lines = [line.strip() for line in (result.content or "").splitlines() if line.strip()]
-        plan = lines[:PLAN_LIMIT] or ["Answer the user's request using the available tools."]
+        plan = lines[:PLAN_LIMIT]
+        if not plan:
+            # A blank plan is not a plan. This used to substitute a sentence the model never wrote and
+            # send `act` to follow it: a fabricated instruction, invisible in the trace and in the
+            # answer. Stop instead, and say why (server finding, 2026-10-02).
+            log.warning(
+                "plan_returned_no_text",
+                trace_id=state.get("trace_id"),
+                finish_reason=result.finish_reason,
+                completion_tokens=result.completion_tokens,
+                reasoning_chars=result.reasoning_chars,
+            )
+            self._tracer.node_span(
+                "plan", state, {"plan": [], "stopped_reason": STOPPED_PLAN_NO_TEXT}
+            )
+            return {
+                **self._calls(state, node="plan", result=result),
+                "plan": [],
+                "stopped_reason": STOPPED_PLAN_NO_TEXT,
+                "step_count": int(state.get("step_count") or 0),
+            }
         self._tracer.node_span("plan", state, {"plan": plan})
         return {
             **self._calls(state, node="plan", result=result),
@@ -985,15 +1011,69 @@ class AgentRunner:
             AIMessage(content=_evidence(state)),
         ]
         result = await self._ask(messages, [], node="verify", state=state)
+        calls = self._calls(state, node="verify", result=result)
         verdict = (result.content or "").strip().upper()
+
+        if not verdict:
+            # One bounded retry, because a blank verdict is not evidence of success. The previous
+            # behaviour read it as "not DONE" ? i.e. CONTINUE ? so a model that stopped after its
+            # analysis channel made every run walk to its step cap, silently (server finding,
+            # 2026-10-02: 10/10 attempts blank on this shape).
+            log.warning(
+                "verify_returned_no_text",
+                trace_id=state.get("trace_id"),
+                attempt=1,
+                finish_reason=result.finish_reason,
+                completion_tokens=result.completion_tokens,
+                reasoning_chars=result.reasoning_chars,
+            )
+            retry = await self._ask(messages, [], node="verify", state=state)
+            # Both calls are model calls and both belong in the audit row: a retry that is invisible
+            # is a cost nobody can account for.
+            calls = {
+                "model_calls": [
+                    *(calls.get("model_calls") or []),
+                    *(self._calls(state, node="verify", result=retry).get("model_calls") or []),
+                ]
+            }
+            result = retry
+            verdict = (result.content or "").strip().upper()
+
+        if not verdict:
+            # Still nothing. Stop here rather than loop: a verdict nobody can read is not a reason to
+            # keep acting, and the run says so in its answer.
+            log.warning(
+                "verify_stopped_no_verdict",
+                trace_id=state.get("trace_id"),
+                attempts=2,
+                finish_reason=result.finish_reason,
+                reasoning_chars=result.reasoning_chars,
+            )
+            self._tracer.node_span(
+                "verify", state, {"verdict": "NO_VERDICT", "stopped_reason": STOPPED_VERIFY_NO_TEXT}
+            )
+            return {
+                **calls,
+                "messages": [_assistant_message(result)],
+                "stopped_reason": STOPPED_VERIFY_NO_TEXT,
+            }
+
         finished = verdict.startswith("DONE")
         self._tracer.node_span("verify", state, {"verdict": "DONE" if finished else "CONTINUE"})
         # `answer` is deliberately NOT touched here: only `respond` writes it, so a verdict
         # can never leak into the user-facing text.
         return {
-            **self._calls(state, node="verify", result=result),
+            **calls,
             "messages": [_assistant_message(result)],
         }
+
+    def _after_plan(self, state: AgentState) -> str:
+        """Route after `plan`: to `respond` when the plan was blank, to `act` otherwise.
+
+        Routing only — the reason is written by `_plan`, because a conditional-edge function's return
+        value is a path and writing state here would silently do nothing.
+        """
+        return "respond" if state.get("stopped_reason") else "act"
 
     def _after_verify(self, state: AgentState) -> str:
         """Routing only. Every state write (including `limit_reason`) happens in a node.
@@ -1003,6 +1083,10 @@ class AgentRunner:
         `_act` and `_verify` set it themselves.
         """
         if state.get("limit_reason"):
+            return "respond"
+        # A node that recorded a stop for a reason other than a cap: a blank verdict here means the
+        # run cannot be verified, so continuing would act on a result nobody checked.
+        if state.get("stopped_reason"):
             return "respond"
         messages = state.get("messages") or []
         last: BaseMessage | None = messages[-1] if messages else None
@@ -1076,6 +1160,11 @@ class AgentRunner:
                 # fell through to a message that blamed Odoo for a failure that had not happened.
                 outcome = _no_answer(limit_reason, state, model_blank=True)
                 answer, reason = outcome.text, outcome.reason
+            elif state.get("stopped_reason") == STOPPED_VERIFY_NO_TEXT:
+                # The evidence is real, so the summary is kept — dropping it would be its own kind of
+                # dishonesty, since the data was fetched. What must not happen is that it reads as a
+                # *verified* result when the verdict never arrived.
+                answer = _UNVERIFIED_CAVEAT + answer
 
         if reason is not None:
             # One structured line per unattributed answer, so the next occurrence is diagnosable
@@ -1102,6 +1191,9 @@ class AgentRunner:
                 # The reason belongs on the span: a trace has to answer "why is there no answer?"
                 # without a reader inferring it from the wording of the message.
                 "no_answer_reason": reason,
+                # Why the loop stopped, when it stopped for something other than a cap. On the span so
+                # a trace answers "why did this run stop?" without reading the answer text.
+                "stopped_reason": state.get("stopped_reason"),
                 "finish_reason": finish_reason,
                 "completion_tokens": completion_tokens,
             },
@@ -1344,6 +1436,21 @@ NO_ANSWER_MODEL_RETURNED_NO_TEXT: Final = "model_returned_no_text"
 NO_ANSWER_TOOL_RETURNED_NO_DATA: Final = "tool_returned_no_data"
 NO_ANSWER_NO_TOOLS_RAN: Final = "no_tools_ran"
 
+#: The loop stopped because a node returned no text at all — not because a cap was reached.
+#: Both are the model stopping after its analysis channel (server finding, 2026-10-02), and both
+#: were previously silent: a blank `plan` was replaced by a sentence the model never wrote, and a
+#: blank `verify` was read as CONTINUE so the run walked to its step cap.
+STOPPED_PLAN_NO_TEXT: Final = "plan_returned_no_text"
+STOPPED_VERIFY_NO_TEXT: Final = "verify_returned_no_text"
+
+#: Prefixed to an answer that *is* grounded when the run could not be verified. The summary is
+#: real, so it is kept; what must not happen is that it reads as a verified result.
+_UNVERIFIED_CAVEAT: Final = (
+    "⚠ Не вдалося підтвердити результат: "
+    "перевірка не повернула вердикт. "
+    "Нижче — лише те, що вдалося отримати.\n\n"
+)
+
 
 @dataclass(frozen=True)
 class _NoAnswer:
@@ -1358,34 +1465,39 @@ def _no_answer(
 ) -> _NoAnswer:
     """Why the run has no answer, and the honest message for that reason.
 
-    **The server finding this exists for.** A run whose `get_my_tasks` call returned `ok: true` — the
-    trace shows the tool span succeeding and the step recorded — answered
-    "Не вдалося отримати дані з Odoo для цього запиту...". That was the last line of this function, and
-    it was reached because the *model* returned no text: the `respond` generation reported 243
-    completion tokens with an empty `content`. The data had been fetched; the message said it had not.
-    Four of the last twelve traces had the same shape.
-
-    Two paths reached that line and both meant something else:
-
-    * `_respond` (no grounded evidence) — no step succeeded, often because **no step ran** at all,
-      which is what a greeting produces;
-    * `_respond` (blank model answer) — evidence existed and the model **produced no text**.
+    **The server findings this exists for.** First: a run whose `get_my_tasks` call returned `ok: true`
+    answered "Не вдалося отримати дані з Odoo…" because the *model* returned no text — 243 completion
+    tokens, empty `content`. The data had been fetched; the message said it had not. Second, and
+    larger: against the server stand's model, 10 of 10 attempts on the real `respond` shape came back
+    `finish_reason=stop` with `content_len=0` and a populated reasoning channel, and the same blank
+    text was arriving on `plan` and `verify` — where it was read as "no plan needed" and as
+    "CONTINUE" respectively, both silently.
 
     **Reason and message are computed together, deliberately.** Two functions — one deciding the
     reason, one the wording — would eventually disagree, and the disagreement would be exactly the bug
-    being fixed: a reason saying "model" under a message saying "data". A dataclass makes that
-    impossible rather than merely discouraged.
+    being fixed: a reason saying "model" under a message saying "data".
 
-    **Order is precedence, and it preserves the previous behaviour where that behaviour was right.** A
-    refusal outranks a failure, a failure outranks the cap (guarded by
-    `test_a_failed_fetch_outranks_the_cap_in_the_final_answer`), and the cap outranks a silent model.
-    Only the cases that previously fell through to the Odoo wording get new, accurate text.
+    **The order below is precedence, and each position is load-bearing:**
 
-    Fail-closed is untouched: every branch is still written in code, and `_respond` still refuses to ask
-    the model to summarise nothing. This function decides *what the user is told*, never *whether an
-    answer may be invented*.
+    1. a refusal outranks everything — "you have no access" is the most specific thing to say;
+    2. a failed tool outranks a cap (`test_a_failed_fetch_outranks_the_cap_in_the_final_answer`);
+    3. a blank plan outranks the rest: the run never started, so nothing else has happened yet;
+    4. **a cap outranks the no-steps check**, because a wall-clock stop before the first model call has
+       no steps either and must still report the cap (`test_a_wall_clock_cap_stops_before_any_step`);
+    5. **nothing ran** outranks a blank verdict: there was nothing to verify;
+    6. a blank verdict is the stop the operator asked to be recorded;
+    7. an empty payload is more specific than a silent model, and above it because both are true in
+       that case — reversed, this reason would be unreachable, and a reason that can never fire is a
+       claim the code does not honour;
+    8. a silent model is the original finding's case;
+    9. the fallback repeats "nothing ran", which is now unreachable but costs nothing to keep total.
+
+    Fail-closed is untouched: every branch is code-written, and `_respond` still refuses to ask the
+    model to summarise nothing. This function decides *what the user is told*, never *whether an answer
+    may be invented*.
     """
     steps = state.get("steps_taken") or []
+    stopped = state.get("stopped_reason")
 
     refusals = [
         step
@@ -1408,34 +1520,47 @@ def _no_answer(
             "Відповіді на це запитання я надати не можу.",
         )
 
+    if stopped == STOPPED_PLAN_NO_TEXT:
+        return _NoAnswer(
+            STOPPED_PLAN_NO_TEXT,
+            "Не вдалося скласти план виконання: модель не повернула план, тому запит не виконувався. "
+            "Спробуйте переформулювати запит.",
+        )
+
     if limit_reason:
-        # No longer claims the data was unreachable: when this is reached with successful steps, the
-        # run *did* fetch something and simply ran out of room. Claiming otherwise was the same class
-        # of falsehood as the reported bug, one branch higher up.
+        # No longer claims the data was unreachable: reached with successful steps, the run *did* fetch
+        # something and simply ran out of room. Claiming otherwise was the same class of falsehood as
+        # the reported bug, one branch higher up.
         return _NoAnswer(
             NO_ANSWER_LIMIT_REACHED,
             "Не вдалося завершити запит: досягнуто ліміт виконання "
             f"({limit_reason}), тому відповідь може бути неповною.",
         )
 
+    if not steps:
+        return _NoAnswer(
+            NO_ANSWER_NO_TOOLS_RAN,
+            "Не вдалося сформувати відповідь на це запитання: дані не запитувалися. "
+            "Спробуйте переформулювати запит.",
+        )
+
+    if stopped:
+        return _NoAnswer(
+            STOPPED_VERIFY_NO_TEXT,
+            "Не вдалося підтвердити результат: перевірка не повернула вердикт, тому відповіді "
+            "на це запитання я надати не можу.",
+        )
+
     grounded = [step for step in steps if step.get("ok")]
     if grounded and all(not step.get("result") for step in grounded):
         # "The search ran and found nothing" is a real, grounded outcome, and it reads differently
         # from "we could not reach Odoo".
-        #
-        # **Ordered above `model_blank` on purpose.** When every successful tool returned an empty
-        # payload *and* the model said nothing, both reasons are true and this one is the more
-        # specific: the model had nothing to work with. Putting it below `model_blank` would make it
-        # unreachable — `model_blank` is true in exactly that case — and an unreachable reason is a
-        # claim the code does not honour, which is the failure mode this whole finding is about.
         return _NoAnswer(
             NO_ANSWER_TOOL_RETURNED_NO_DATA,
             "Запит виконано, але Odoo не повернув даних за цими умовами. Спробуйте уточнити запит.",
         )
 
     if model_blank:
-        # The case that produced the finding: the tools returned data (a non-empty payload) and the
-        # model said nothing.
         return _NoAnswer(
             NO_ANSWER_MODEL_RETURNED_NO_TEXT,
             "Дані з Odoo отримано, але сформувати відповідь не вдалося: модель не повернула текст. "
