@@ -447,3 +447,54 @@ working, not a crash. Two things are still wrong:
 4. Collect first on a live stand: how often it is `CancelledError` versus `RuntimeError`, and whether it
    differs between the interactive (gateway) and background (worker) paths.
 
+
+---
+
+## 10. SCHEDULED — `verify`'s token budget is marginal: the tail is bimodal, not gaussian
+
+**Status:** identified by measurement (2026-10-03), scoped, deliberately not fixed yet. Blocks nothing:
+the acceptance run for the message-shape fix scored **plan 20/20, respond 20/20, verify 19/20**, and the
+one failure degrades correctly under the new code.
+
+**The measurement** (`scripts/probe_model_shape.py --node <n> --variant <n>-merged-tool-turn --repeat 20`,
+server stand, vLLM 0.28.0):
+
+| node | verdicts | completion tokens | budget | headroom |
+| --- | --- | --- | --- | --- |
+| plan | 20/20 `CONTENT_OK` | min 280, p50 369, p90 369, max 369 | 3072 | 88% |
+| respond | 20/20 `CONTENT_OK` | min 228, p50 228, p90 228, max 263 | 2048 | 87% |
+| **verify** | **19/20 `CONTENT_OK`** | min 443, p50 443, p90 443, **max 2048 (cap)** | 2048 | **0%** |
+
+**Why this is not "raise the number".** Nineteen attempts landed on *exactly* 443 tokens — identical, at
+temperature 0, and consistent with the 446 peak the budget was originally sized from (`graph.py`,
+`NODE_MAX_TOKENS`: "roughly 4x those peaks"). The twentieth consumed the entire cap and was cut off
+(`finish_reason=length`), so its natural length is **unknown** — it is at least 2048. The distribution is
+therefore bimodal: a deterministic normal case, plus a rare long-reasoning case with no observed upper
+bound. Raising the cap to 4096 may only move the wall, and the constant is documented as *measured
+rather than guessed*, so guessing a bigger number is the wrong move.
+
+**A plausible cause, and it is a consequence of ADR 0015.** `verify.md` reached the local model for the
+**first time** with the shape fix, because the served template drops every `system` message after
+`messages[0]`. A node that has just been told, in detail, how to judge completeness may well deliberate
+more than one that was never told. So this tail may be new rather than pre-existing — which also means
+it is not evidence that the shape change was wrong, and it is worth checking rather than assuming.
+
+**What already protects production.** A truncated verdict carries no text, so `_verify` now spends one
+bounded retry and, failing that, records `verify_returned_no_text` and stops honestly
+(`graph.py`, ADR 0015) instead of reading blank as CONTINUE and walking to the step cap. The cost of the
+tail today is one wasted call, not a silent wrong answer.
+
+**Next concrete step — measure before changing a constant.**
+
+1. `--node verify --variant verify-merged-tool-turn --repeat 20 --max-tokens 4096` — does the tail still
+   reach the cap when given twice the room? If it does, a bigger budget is not the fix.
+2. `--extra-json '{"chat_template_kwargs": {"reasoning_effort": "low"}}' --repeat 20` — the served
+   template's own header documents `reasoning_effort` (default `"medium"`), and this node's entire
+   output is `DONE`/`CONTINUE`, so a long analysis is waste by construction. If the tail collapses, that
+   is the fix and the cap stays as measured.
+3. Whichever wins, the parameter is **local-only** (the operator's rule): it belongs in
+   `chat.LOCAL_ONLY_BODY`, which today is per-*call*, not per-*node*. A per-node parameter therefore
+   needs the node name plumbed from `_ask` through the `ChatFn` signature to `build_payload`, and a
+   payload test keyed on destination (`tests/unit/router/test_local_only_body.py` is the pattern).
+4. Only if neither works: raise `verify` towards 4096 and re-measure 20 attempts, recording the new
+   tail — so the constant stays measured rather than guessed.
