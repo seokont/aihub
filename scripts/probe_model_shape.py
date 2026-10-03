@@ -298,6 +298,16 @@ def main(argv: list[str] | None = None) -> int:
         help="print the exact messages sent, so 'which prompt produced this' is never inference",
     )
     parser.add_argument(
+        "--reasoning-effort",
+        choices=("low", "medium", "high"),
+        default=None,
+        help=(
+            "set chat_template_kwargs.reasoning_effort, which the served template documents (default "
+            "'medium'). Exists so this cannot be lost to shell quoting: pass the level, not JSON. "
+            "--extra-json still wins if both are given."
+        ),
+    )
+    parser.add_argument(
         "--extra-json",
         default=None,
         help=(
@@ -323,6 +333,13 @@ def main(argv: list[str] | None = None) -> int:
         else SYNTHETIC_EVIDENCE
     )
     extra: dict[str, object] = json.loads(args.extra_json) if args.extra_json else {}
+    if args.reasoning_effort:
+        # Merge rather than replace: `--extra-json` may already carry other template kwargs, and a
+        # dict value out of the parsed JSON is not `object` to mypy, hence the narrow cast.
+        existing = extra.get("chat_template_kwargs")
+        template_kwargs: dict[str, object] = dict(existing) if isinstance(existing, dict) else {}
+        template_kwargs.setdefault("reasoning_effort", args.reasoning_effort)
+        extra["chat_template_kwargs"] = template_kwargs
     variant = args.variant or args.node
     if variant not in variants_for(args.node):
         raise SystemExit(
@@ -443,8 +460,15 @@ def main(argv: list[str] | None = None) -> int:
             index = min(len(ordered) - 1, max(0, round(fraction * (len(ordered) - 1))))
             return ordered[index]
 
-        budget = NODE_MAX_TOKENS[args.node]
+        # The budget the REQUEST used, which is `--max-tokens` when given and the node's own default
+        # otherwise. Reporting the node default here made a 4096 run print `budget=2048` and judge its
+        # headroom against a number it had not used — a reporting bug that invalidated the comparison.
+        budget = max_tokens
+        default = NODE_MAX_TOKENS[args.node]
         headroom = (1 - max(ordered) / budget) * 100 if budget else 0.0
+        print(
+            f"  variant={variant}  node={args.node}  max_tokens={budget} (node default {default})"
+        )
         print(
             f"  completion tokens: n={len(ordered)} min={ordered[0]} "
             f"p50={percentile(0.5)} p90={percentile(0.9)} max={ordered[-1]} "
@@ -456,7 +480,7 @@ def main(argv: list[str] | None = None) -> int:
         if truncated:
             print(
                 f"  !! {len(truncated)} attempt(s) hit the {budget}-token cap "
-                f"(attempts {truncated}) — the node's budget is too tight for this shape"
+                f"(attempts {truncated}) — the budget in use is too tight for this shape"
             )
         elif ordered[-1] >= budget * 0.9:
             print(

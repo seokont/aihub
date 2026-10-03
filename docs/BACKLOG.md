@@ -498,3 +498,49 @@ tail today is one wasted call, not a silent wrong answer.
    payload test keyed on destination (`tests/unit/router/test_local_only_body.py` is the pattern).
 4. Only if neither works: raise `verify` towards 4096 and re-measure 20 attempts, recording the new
    tail — so the constant stays measured rather than guessed.
+
+### 10a. Update — the incomplete fixture answers CONTINUE, and the 4096 run was invalid
+
+**The fixture verdict is good news and it closes the model-side question.** `verify` on
+`_fixtures/verify-incomplete-evidence.txt` returned **CONTINUE 5/5**, content `"CONTINUE\ntasks"`,
+661 tokens each. So `verify` is not a formality that always says DONE: on evidence that answers only
+part of the canonical question it asks for more work. Combined with the 19/20 `CONTENT_OK` on complete
+evidence, both verdicts are reachable on the server model.
+
+**The verdict parser tolerates that content, and now says so in a test.** The rule is
+`(content or "").strip().upper().startswith("DONE")`, so `"CONTINUE\ntasks"` → CONTINUE (the trailing
+word is irrelevant) and `"DONE\ntasks"` → DONE. The rule is read in **two** places — `_verify` records
+the verdict on the span, `_after_verify` decides the route by re-reading the last message — so
+`test_verify_verdict.py` now asserts both readers agree across the shapes a model actually emits,
+including the observed `"CONTINUE\ntasks"`, case and whitespace variants, and `"NOT DONE"`. Drift is the
+risk: a trace saying CONTINUE while the run answered anyway. Mutation-checked by giving
+`_after_verify` substring matching while `_verify` keeps `startswith` — the `NOT DONE` case fails.
+
+**The 4096 run was invalid, and two defects in the probe caused the confusion.**
+
+1. **The summary printed the node default, not the budget in use.** `--max-tokens 4096` produced
+   `budget=2048`, and the headroom and the "within 10% of budget" test were computed against 2048 as
+   well — so a 4096 run was *judged* as a 2048 run. The summary now prints
+   `max_tokens=<used> (node default <default>)` and computes against the value actually sent.
+2. **The request itself was never affected.** `max_tokens = args.max_tokens or NODE_MAX_TOKENS[node]`
+   feeds `payload["max_tokens"]`, and `git log` confirms the commits between the two verify runs touched
+   only the reporting (`1dfdb42`) and, before both runs, the variants (`999a98c`). The payload path did
+   not change. `tests/unit/scripts/test_probe_payload.py` now pins it: `--max-tokens` reaches the body,
+   the node default applies without the flag, and the tool-turn variant adds its tool without touching
+   the budget.
+
+**The most likely explanation for the contradiction, and it is now a test.** `--variant` defaults to
+the node's own name — which is the **baseline, broken** shape (two system messages, evidence as a
+trailing assistant turn). A run that omits `--variant verify-merged-tool-turn` measures the original
+fault and reports `REASONING_ONLY` for every attempt, which is exactly what the 4096 run showed.
+`test_the_baseline_variant_is_what_an_unflagged_run_sends` asserts an unflagged run sends the broken
+shape, so this can never again look like a contradiction between two "max_tokens" runs.
+
+**Shell quoting cost a run, so the parameter no longer goes through a shell.** `--reasoning-effort
+{low,medium,high}` sets `chat_template_kwargs.reasoning_effort` (the served template's own documented
+kwarg, default `"medium"`), merging with rather than replacing other template kwargs, and still losing
+to `--extra-json` when both are given.
+
+**Still open:** whether `reasoning_effort=low` collapses the tail, and whether a doubled budget still
+reaches the cap. Both are to be re-run with the corrected reporting, and the operator has held the
+per-node local-only plumbing until then.

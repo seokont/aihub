@@ -18,16 +18,54 @@ asserted here: it is a property of the served model, and the operator probes it 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage
 
 from moni_agent.graph import AgentRunner
 from moni_agent.limits import RunLimits
+from moni_agent.state import AgentState, ToolResult
 
 from .stubs import AllowAllPolicy
 from .test_graph import FakeModel, FakeToolBox, tool_call
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 INCOMPLETE_FIXTURE = REPO_ROOT / "_fixtures" / "verify-incomplete-evidence.txt"
+
+
+def _state() -> AgentState:
+    """One successful tool call with its paired turns — what `verify` is driven with.
+
+    Built rather than produced by a run because these tests are about the *verdict rule*, and a full
+    run would put the plan and the routing in the way of reading it.
+    """
+    step = ToolResult(
+        step=1,
+        tool="find_sale_orders",
+        tool_call_id="call_1",
+        arguments={},
+        ok=True,
+        executed=True,
+        result={"name": "S22714", "state": "sale"},
+    )
+    state: AgentState = {
+        "messages": [
+            HumanMessage(content="Чому замовлення S22714 затримується?"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "call_1", "name": "find_sale_orders", "args": {}, "type": "tool_call"}
+                ],
+            ),
+        ],
+        "steps_taken": [step],
+        "plan": ["find_sale_orders"],
+        "trace_id": "run-verify",
+        "allowed_tools": ["find_sale_orders"],
+        "step_count": 1,
+    }
+    return state
 
 
 def _runner(
@@ -117,3 +155,84 @@ async def test_the_incomplete_evidence_fixture_is_present_and_still_incomplete()
     assert len(text) < 2000, (
         "the fixture is growing into a full evidence block; it is meant to be visibly insufficient"
     )
+
+
+# ---------------------------------------------------------------------------
+# The verdict parser, on the shapes the model actually emits
+# ---------------------------------------------------------------------------
+#
+# The server stand answered the incomplete fixture with the content `CONTINUE\ntasks` — a verdict plus a
+# trailing word. The rule is `content.strip().upper().startswith("DONE")`, and it is read in **two**
+# places: `_verify` records the verdict on the span, and `_after_verify` decides the route by re-reading
+# the last message. Two readers of one rule can drift, and the drift would be invisible — the trace
+# saying CONTINUE while the run answered anyway. Both are asserted together, per input.
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_verdict", "expected_route"),
+    [
+        # The observed server output. The trailing word must not confuse either reader.
+        ("CONTINUE\ntasks", "CONTINUE", "act"),
+        ("DONE\ntasks", "DONE", "respond"),
+        # Whitespace and case, which a model will produce.
+        ("  done  ", "DONE", "respond"),
+        ("continue", "CONTINUE", "act"),
+        # A negation must not read as an affirmation: the safe direction is "keep working".
+        ("NOT DONE", "CONTINUE", "act"),
+        ("не завершено", "CONTINUE", "act"),
+    ],
+)
+async def test_the_verdict_is_read_the_same_way_by_the_span_and_by_the_router(
+    content: str, expected_verdict: str, expected_route: str
+) -> None:
+    from .test_no_answer_reason import RecordingTracer
+
+    # `Any`, matching the other agent suites: the fake satisfies the protocol structurally, and
+    # declaring a type it does not have is what `cast` would be misused for.
+    tracer: Any = RecordingTracer()
+    model = FakeModel([content])
+    runner = AgentRunner(policy=AllowAllPolicy(), toolbox=FakeToolBox(), model=model, tracer=tracer)
+
+    update = await runner._verify(_state())
+    # A plain dict, then a cast: `update` is not a TypedDict, and mypy rejects expanding one into a
+    # TypedDict literal. The merged value is only ever read by `_after_verify`.
+    merged: dict[str, Any] = dict(_state())
+    merged.update(update)
+    route = runner._after_verify(cast(AgentState, merged))
+
+    spans = [payload for name, payload in tracer.spans if name == "verify"]
+    assert spans, "verify recorded no span"
+    assert spans[-1].get("verdict") == expected_verdict, (
+        f"the span read {spans[-1].get('verdict')!r} from {content!r}"
+    )
+    assert route == expected_route, (
+        f"the router sent {content!r} to {route!r} while the span said {expected_verdict!r}: the two "
+        "readers of the verdict rule disagree"
+    )
+
+
+async def test_an_incomplete_evidence_run_keeps_working_rather_than_answering() -> None:
+    """The whole point of CONTINUE, through the real loop, on the fixture's shape.
+
+    The model's own half — that it *chooses* CONTINUE on the incomplete fixture — is a property of the
+    served model and is measured on the server (5/5 CONTINUE, 661 tokens each). This asserts the other
+    half: given that verdict, the run gathers more instead of answering the canonical question from an
+    order header with no stock, MRP or picking data.
+    """
+    model = FakeModel(
+        [
+            "Спершу знайти замовлення",
+            tool_call("find_sale_orders"),
+            "CONTINUE\ntasks",  # the observed server content, verbatim
+            tool_call("get_deliveries"),
+            "DONE",
+            "Замовлення S22714 затримується…",
+        ]
+    )
+
+    state = await _run(
+        _runner(model, FakeToolBox()), allowed=["find_sale_orders", "get_deliveries"]
+    )
+
+    assert state["step_count"] == 2, "the run answered instead of gathering more evidence"
+    assert state.get("stopped_reason") in (None, "")
