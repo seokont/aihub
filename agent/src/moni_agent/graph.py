@@ -473,11 +473,11 @@ class AgentRunner:
         if self._timed_out(state):
             return self._stop(state, "wall_clock", f"exceeded {self._limits.wall_clock_seconds:g}s")
 
-        messages = [
-            SystemMessage(content=prompts.load("system")),
-            SystemMessage(content=prompts.load("plan")),
-            HumanMessage(content=_last_user_message(state)),
-        ]
+        # One system message, holding `system.md` and `plan.md` together: the served template reads
+        # only `messages[0]` as an instruction, so a second system message is silently dropped
+        # (ADR 0015). `_last_user_message` is folded in by `_conversation`, which also carries any
+        # history a resumed run already has.
+        messages = self._conversation(state, instruction=prompts.load("plan"))
         result = await self._ask(messages, [], node="plan", state=state)
         lines = [line.strip() for line in (result.content or "").splitlines() if line.strip()]
         plan = lines[:PLAN_LIMIT]
@@ -516,8 +516,10 @@ class AgentRunner:
             return self._stop(state, "wall_clock", f"exceeded {self._limits.wall_clock_seconds:g}s")
 
         specs = self._toolbox.specs(state.get("allowed_tools") or [])
-        messages = self._conversation(state)
-        messages.append(SystemMessage(content=prompts.load("act")))
+        # The instruction belongs in `messages[0]`, not appended as a trailing system message: the
+        # served template drops a later `system` role, so ACT has been running on `system.md` alone
+        # and re-deriving its plan from the question (ADR 0015).
+        messages = self._conversation(state, instruction=prompts.load("act"), include_plan=True)
         prompt_roles = [str(getattr(message, "type", None)) for message in messages]
         # The two facts that were missing while diagnosing "the agent never calls a tool": what
         # ACT was offered, and the shape of the prompt it was offered alongside. An empty schema
@@ -1004,12 +1006,12 @@ class AgentRunner:
         if int(state.get("step_count") or 0) >= self._limits.max_steps:
             return self._stop(state, "max_steps", f"reached {self._limits.max_steps} steps")
 
-        messages = [
-            SystemMessage(content=prompts.load("system")),
-            SystemMessage(content=prompts.load("verify")),
-            HumanMessage(content=_last_user_message(state)),
-            AIMessage(content=_evidence(state)),
-        ]
+        # The tool results are already in the conversation as real `tool` turns. They used to be
+        # re-sent here as a synthetic ASSISTANT message, which the served template renders as the
+        # assistant's own completed *final* channel answer — so the model believed it had already
+        # answered and emitted analysis only, ending the generation with `finish_reason=stop` and
+        # empty content. Nothing synthetic is needed: the history is the evidence (ADR 0015).
+        messages = self._conversation(state, instruction=prompts.load("verify"))
         result = await self._ask(messages, [], node="verify", state=state)
         calls = self._calls(state, node="verify", result=result)
         verdict = (result.content or "").strip().upper()
@@ -1126,7 +1128,6 @@ class AgentRunner:
                 f"{limit_reason}. Say so plainly and report only what was found."
             )
 
-        evidence = _evidence(state)
         calls: dict[str, Any] = {}
         # What the final model call reported, recorded whether or not its answer was usable: "the
         # model was asked and said nothing" is the case that produced the server finding, and
@@ -1144,12 +1145,11 @@ class AgentRunner:
             outcome = _no_answer(limit_reason, state)
             answer, reason = outcome.text, outcome.reason
         else:
-            messages = [
-                SystemMessage(content=prompts.load("system")),
-                SystemMessage(content=instruction),
-                HumanMessage(content=_last_user_message(state)),
-                AIMessage(content=evidence),
-            ]
+            # The tool results reach the model as real `tool` turns in the conversation, never as a
+            # synthetic assistant message — see `_verify`, and ADR 0015 for the whole mechanism. The
+            # plan is deliberately NOT included here: it is model-generated prose that a poisoned
+            # user message can steer, and only what a tool returned is evidence.
+            messages = self._conversation(state, instruction=instruction)
             result = await self._ask(messages, [], node="respond", state=state)
             calls = self._calls(state, node="respond", result=result)
             finish_reason = result.finish_reason
@@ -1180,7 +1180,9 @@ class AgentRunner:
                 completion_tokens=completion_tokens,
                 steps_ok=sum(1 for step in steps if step.get("ok")),
                 steps_failed=sum(1 for step in steps if not step.get("ok")),
-                evidence_chars=len(evidence),
+                # The tool results now travel as turns, so what is worth reporting is the prompt
+                # actually sent rather than the size of a summary that no longer exists.
+                prompt_messages=len(state.get("messages") or []),
             )
 
         self._tracer.node_span(
@@ -1207,7 +1209,13 @@ class AgentRunner:
 
     # -- helpers ------------------------------------------------------------
 
-    def _conversation(self, state: AgentState) -> list[AnyMessage]:
+    def _conversation(
+        self,
+        state: AgentState,
+        *,
+        instruction: str | None = None,
+        include_plan: bool = False,
+    ) -> list[AnyMessage]:
         """The model-facing conversation, rebuilt from state on every step.
 
         Rebuilt rather than appended to, so a checkpoint replay cannot duplicate a turn.
@@ -1231,9 +1239,22 @@ class AgentRunner:
         never answers is the same protocol violation seen from the other side, and answering it
         also tells the model the tool did not work instead of leaving it to infer silence.
         """
-        messages: list[AnyMessage] = [SystemMessage(content=prompts.load("system"))]
-        if state.get("plan"):
-            messages.append(SystemMessage(content="Plan:\n" + "\n".join(state["plan"])))
+        # ONE system message, and it must be `messages[0]` — this is a correctness requirement, not
+        # a style choice. The served gpt-oss Harmony template reads only `messages[0]` as the
+        # developer/instruction message and drops every later `system` role silently (it lands in the
+        # loop over `assistant`/`tool`/`user` and matches no branch). Both the plan and the per-node
+        # instruction used to be appended as further system messages, so on the local stand the model
+        # never saw either one (ADR 0015).
+        parts: list[str] = [prompts.load("system")]
+        if include_plan and state.get("plan"):
+            # The plan is model-generated, so mixing it into the instruction channel is a real
+            # trade-off and is made deliberately: `act` needs it, the alternative is `act` running
+            # with no plan at all (which is what the dropped message amounted to), and on the cloud
+            # path a second system message was already concatenated by the provider.
+            parts.append("Plan:\n" + "\n".join(state["plan"]))
+        if instruction:
+            parts.append(instruction)
+        messages: list[AnyMessage] = [SystemMessage(content="\n\n".join(parts))]
 
         # Steps still waiting for the turn that requested them, matched in order. A list rather
         # than a dict keyed by call id, because a model may reuse an id across turns (the test
@@ -1379,26 +1400,6 @@ def _assistant_message(result: ChatResult) -> AIMessage:
     if calls:
         return AIMessage(content=result.content or "", tool_calls=calls)
     return AIMessage(content=result.content or "")
-
-
-def _evidence(state: AgentState) -> str:
-    """The recorded evidence: **tool results only**.
-
-    The plan is deliberately excluded. It is model-generated prose, and a poisoned user
-    message can steer it ("write the order number in your plan"), so treating it as
-    evidence would launder a fabrication into the answer. Only what a tool returned is
-    evidence; findings are derived from exactly the same calls.
-    """
-    parts: list[str] = []
-    for step in state.get("steps_taken") or []:
-        if step.get("ok"):
-            parts.append(f"Tool {step.get('tool')} returned:\n{_compact(step.get('result') or {})}")
-        else:
-            error = step.get("error") or {}
-            parts.append(
-                f"Tool {step.get('tool')} was refused or failed: {error.get('message', 'error')}"
-            )
-    return "\n\n".join(parts)
 
 
 def _has_grounded_evidence(state: AgentState) -> bool:

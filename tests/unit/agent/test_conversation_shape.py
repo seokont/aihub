@@ -86,8 +86,14 @@ def _state(
     return state
 
 
-def _wire(state: AgentState) -> list[dict[str, Any]]:
-    return to_wire_messages(_runner()._conversation(state))
+def _wire(state: AgentState, *, include_plan: bool = False) -> list[dict[str, Any]]:
+    """The conversation as it would go on the wire.
+
+    `include_plan` mirrors the real call sites: `act` asks for the plan, while `respond` and `verify`
+    deliberately do not (ADR 0015), so the default here is the safe one.
+    """
+    conversation = _runner()._conversation(state, include_plan=include_plan)
+    return to_wire_messages(conversation)
 
 
 def _assistant_calls_before(wire: list[dict[str, Any]], index: int) -> list[dict[str, Any]] | None:
@@ -328,17 +334,43 @@ def test_a_step_that_no_turn_claims_is_never_emitted_as_an_orphan() -> None:
 
 
 def test_the_rebuilt_history_still_carries_the_question_and_the_plan() -> None:
-    """The fix must not quietly drop the system prompt, the plan or the user's question."""
+    """The fix must not quietly drop the system prompt, the plan or the user's question.
+
+    `include_plan=True` because the plan is now **opt-in** (ADR 0015): `act` asks for it, while
+    `respond` and `verify` deliberately do not, since the plan is model-generated prose that a poisoned
+    user message can steer and only a tool's own output is evidence. What changed here is not that the
+    plan was dropped but that it now travels inside `messages[0]` — the only position the served
+    template reads as an instruction — instead of as a second system message it silently discards.
+    """
     state = _state(
         messages=[HumanMessage(content="Чому S22714 затримується?")],
         steps=[],
         plan=["check the order", "check the delivery"],
     )
 
-    wire = _wire(state)
+    wire = _wire(state, include_plan=True)
 
     assert wire[0]["role"] == "system"
     assert "MONI" in wire[0]["content"] or wire[0]["content"].strip()
     assert any("check the order" in message["content"] for message in wire)
     assert wire[-1]["role"] == "user"
     assert "S22714" in wire[-1]["content"]
+
+
+def test_the_plan_is_absent_unless_a_node_asks_for_it() -> None:
+    """The default is the safe one: the plan is not evidence.
+
+    `_evidence`'s rationale — kept here now that the function is gone — is that the plan is
+    model-generated and a poisoned user message can steer it, so treating it as evidence launders a
+    fabrication into the answer. Making the omission the default means a new node has to opt *in* to
+    seeing the plan rather than inheriting it.
+    """
+    state = _state(
+        messages=[HumanMessage(content="q")],
+        steps=[],
+        plan=["check the order"],
+    )
+
+    wire = _wire(state)
+
+    assert not any("check the order" in message["content"] for message in wire)
