@@ -1,0 +1,22 @@
+FIXTURE — incomplete on purpose. Not real data. Do not treat any value here as fact.
+
+Case: the canonical question "чому замовлення S22714 затримується?" with an evidence block that answers
+only part of it, so a correct `verify` must answer CONTINUE rather than DONE.
+
+Tool find_sale_orders returned:
+{
+  "id": 22714,
+  "name": "S22714",
+  "partner": "ТОВ «Зететик»",
+  "state": "sale",
+  "amount_total": 12450.0,
+  "commitment_date": "2026-10-03"
+}
+
+NOT returned, and required to answer the question:
+- no stock moves for the order lines;
+- no manufacturing orders linked to it;
+- no pickings and no delivery status;
+- no reason for the delay.
+
+The order header alone cannot explain the delay, so the next step is another tool call, not an answer.

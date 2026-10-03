@@ -364,6 +364,10 @@ def main(argv: list[str] | None = None) -> int:
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     counts: dict[str, int] = {}
     tokens: list[int] = []
+    #: Attempts that ended on `finish_reason=length`. Reported separately from a blank answer because
+    #: the fix differs: a truncated generation needs a bigger budget, a blank one needs a message shape
+    #: the model will answer from.
+    truncated: list[int] = []
 
     with httpx.Client(timeout=120.0) as client:
         for attempt in range(1, args.repeat + 1):
@@ -398,6 +402,8 @@ def main(argv: list[str] | None = None) -> int:
             usage = body.get("usage") or {}
             completion_tokens = int(usage.get("completion_tokens") or 0)
             tokens.append(completion_tokens)
+            if facts.get("finish_reason") == "length":
+                truncated.append(attempt)
             print(f"\n  attempt {attempt}: {verdict}")
             print(f"    {json.dumps(facts, ensure_ascii=False)}")
             print(f"    usage: prompt={usage.get('prompt_tokens')} completion={completion_tokens}")
@@ -430,7 +436,35 @@ def main(argv: list[str] | None = None) -> int:
     for verdict, count in sorted(counts.items()):
         print(f"  {verdict:<18} {count}")
     if tokens:
-        print(f"  completion tokens: min={min(tokens)} max={max(tokens)}")
+        ordered = sorted(tokens)
+
+        def percentile(fraction: float) -> int:
+            """Nearest-rank percentile; exact for the small n a probe uses."""
+            index = min(len(ordered) - 1, max(0, round(fraction * (len(ordered) - 1))))
+            return ordered[index]
+
+        budget = NODE_MAX_TOKENS[args.node]
+        headroom = (1 - max(ordered) / budget) * 100 if budget else 0.0
+        print(
+            f"  completion tokens: n={len(ordered)} min={ordered[0]} "
+            f"p50={percentile(0.5)} p90={percentile(0.9)} max={ordered[-1]} "
+            f"budget={budget} headroom={headroom:.0f}%"
+        )
+        # The number the operator asked for: how close the worst case runs to the cap. A max inside
+        # the budget is not the same as a max *comfortably* inside it, and a truncation is a budget
+        # problem by definition — the generation was cut off before it finished.
+        if truncated:
+            print(
+                f"  !! {len(truncated)} attempt(s) hit the {budget}-token cap "
+                f"(attempts {truncated}) — the node's budget is too tight for this shape"
+            )
+        elif ordered[-1] >= budget * 0.9:
+            print(
+                f"  !! worst case {ordered[-1]} is within 10% of the {budget}-token budget; a longer "
+                "answer would truncate"
+            )
+        else:
+            print(f"  ok: worst case {ordered[-1]} leaves {headroom:.0f}% of the budget unused")
 
     print("\nreading")
     if counts.get("REASONING_ONLY"):
