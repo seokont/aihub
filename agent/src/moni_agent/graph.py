@@ -19,6 +19,7 @@ in tests, and the tool layer is a :class:`~moni_agent.mcp_tools.ToolBox` protoco
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -1220,71 +1221,76 @@ class AgentRunner:
 
         Rebuilt rather than appended to, so a checkpoint replay cannot duplicate a turn.
 
-        **Order and pairing are the whole point here.** This previously emitted every
-        human/assistant turn first and every tool result afterwards, from two separate loops, and
-        it dropped each assistant turn's ``tool_calls`` on the way through. The wire shape that
-        produced is invalid for any OpenAI-compatible server: a ``role: "tool"`` message is only
-        meaningful when its ``tool_call_id`` names a call on the *preceding* assistant turn, and
-        there was no such call.
+        **Two protocol invariants, and both have been violated here before.**
 
-        vLLM renders the gpt-oss prompt in the Harmony format, where a tool result's recipient is
-        derived from the call it answers. With nothing to attribute it to, the recipient fell back
-        to the role name, producing the header ``to=tool:`` — the literal string the parser then
-        rejected with a 500 (``HarmonyError: unexpected tokens remaining in message header``).
-        The request body was malformed; the model was never the problem.
+        1. *Order and pairing.* This previously emitted every human/assistant turn first and every tool
+           result afterwards, from two separate loops, and dropped each assistant turn's ``tool_calls``
+           on the way through. vLLM then rendered the tool result with the recipient ``to=tool:`` and its
+           parser rejected the request with a 500. The history is therefore walked **once, in order**.
 
-        So the history is walked **once, in order**, and each assistant turn is immediately
-        followed by one tool message per call it made. Every call is answered — including calls
-        that failed or were refused — because an assistant turn advertising a call the client
-        never answers is the same protocol violation seen from the other side, and answering it
-        also tells the model the tool did not work instead of leaving it to infer silence.
+        2. *Every advertised call is answered.* A strict provider rejects the whole request otherwise:
+           ``An assistant message with 'tool_calls' must be followed by tool messages responding to each
+           'tool_call_id'``. vLLM rendered past the gap, so this went unnoticed until a strict endpoint
+           was tried. Two mechanisms produced it: ``_act`` executes ``result.tool_calls[0]`` while
+           ``_assistant_message`` records **every** call, so a parallel-call turn yielded one answer and
+           one orphan; and the pairing loop had no ``else`` for a call no step matched. The loop below
+           answers each call from a recorded step, else from a tool message the caller supplied, else
+           with a **typed placeholder** saying no result exists — never invented data, and never added to
+           ``steps_taken``, so it cannot become evidence.
+
+        Tool messages supplied by the caller are emitted **with the assistant turn that requested them**
+        rather than left where they were. Adjacency is part of the rule, and a message kept "in place"
+        after an intervening turn breaks it. A caller-supplied tool message that answers no call at all
+        is dropped and logged, which is the same treatment an unattributable *step* already got.
         """
-        # ONE system message, and it must be `messages[0]` — this is a correctness requirement, not
-        # a style choice. The served gpt-oss Harmony template reads only `messages[0]` as the
-        # developer/instruction message and drops every later `system` role silently (it lands in the
-        # loop over `assistant`/`tool`/`user` and matches no branch). Both the plan and the per-node
-        # instruction used to be appended as further system messages, so on the local stand the model
-        # never saw either one (ADR 0015).
         parts: list[str] = [prompts.load("system")]
         if include_plan and state.get("plan"):
             # The plan is model-generated, so mixing it into the instruction channel is a real
             # trade-off and is made deliberately: `act` needs it, the alternative is `act` running
-            # with no plan at all (which is what the dropped message amounted to), and on the cloud
-            # path a second system message was already concatenated by the provider.
+            # with no plan at all, and on the cloud path a second system message was already
+            # concatenated by the provider.
             parts.append("Plan:\n" + "\n".join(state["plan"]))
         if instruction:
             parts.append(instruction)
         messages: list[AnyMessage] = [SystemMessage(content="\n\n".join(parts))]
 
-        # Steps still waiting for the turn that requested them, matched in order. A list rather
-        # than a dict keyed by call id, because a model may reuse an id across turns (the test
-        # helper in test_graph.py deliberately does): first call takes the first matching step,
-        # which is the only pairing that preserves the conversation's meaning. A step matching
-        # no call is dropped rather than emitted at the end — an unattributable tool result is
-        # exactly the malformed input this method exists to avoid.
+        # Steps still waiting for the turn that requested them, matched in order. A list rather than a
+        # dict keyed by call id, because a model may reuse an id across turns: first call takes the
+        # first matching step, which is the only pairing that preserves the conversation's meaning.
         remaining = [step for step in (state.get("steps_taken") or []) if step.get("tool_call_id")]
 
+        # Caller-supplied tool messages, indexed by the call they answer. They are emitted with their
+        # assistant turn, so the linear walk below skips them where they appear.
+        supplied: dict[str, ToolMessage] = {}
+        supplied_order: list[str] = []
+        for message in state.get("messages") or []:
+            if getattr(message, "type", None) != "tool":
+                continue
+            key = str(getattr(message, "tool_call_id", "") or "")
+            supplied_order.append(key)
+            supplied.setdefault(
+                key,
+                ToolMessage(
+                    content=str(getattr(message, "content", "") or ""),
+                    tool_call_id=key,
+                    name=getattr(message, "name", None) or None,
+                ),
+            )
+
+        synthesised: list[str] = []
         for message in state.get("messages") or []:
             kind = getattr(message, "type", None)
-            content = str(getattr(message, "content", "") or "")
             if kind == "human":
-                messages.append(HumanMessage(content=content))
+                messages.append(HumanMessage(content=str(getattr(message, "content", "") or "")))
             elif kind == "tool":
-                # History handed in by the caller may already contain tool results; keep them
-                # where they are rather than reordering the conversation around them.
-                messages.append(
-                    ToolMessage(
-                        content=content,
-                        tool_call_id=str(getattr(message, "tool_call_id", "") or ""),
-                        name=getattr(message, "name", None) or None,
-                    )
-                )
+                # Emitted with its assistant turn above; see the docstring.
+                continue
             elif kind == "ai":
                 calls = [dict(call) for call in (getattr(message, "tool_calls", None) or [])]
                 messages.append(
-                    AIMessage(content=content, tool_calls=calls)
+                    AIMessage(content=str(getattr(message, "content", "") or ""), tool_calls=calls)
                     if calls
-                    else AIMessage(content=content)
+                    else AIMessage(content=str(getattr(message, "content", "") or ""))
                 )
                 for call in calls:
                     wanted = str(call.get("id"))
@@ -1293,6 +1299,17 @@ class AgentRunner:
                             remaining.pop(index)
                             messages.append(_tool_message(step))
                             break
+                    else:
+                        # No recorded step. Answer it anyway: silently omitting this is the orphan the
+                        # provider rejects, and the docstring above promised the opposite for as long
+                        # as the branch was missing.
+                        answer = supplied.pop(wanted, None)
+                        if answer is not None:
+                            messages.append(answer)
+                        else:
+                            messages.append(_missing_tool_message(call, state))
+                            synthesised.append(wanted)
+
         if remaining:
             # Not fatal, but it means state holds steps no turn claims. Logged rather than
             # silently dropped, because the honest reading is a state bug upstream.
@@ -1300,6 +1317,22 @@ class AgentRunner:
                 "orphan_tool_steps",
                 count=len(remaining),
                 tools=[str(step.get("tool")) for step in remaining],
+                trace_id=state.get("trace_id"),
+            )
+        if synthesised:
+            # The reverse, and the one that caused a production 400: a call with no result. Answered so
+            # the request is renderable, and logged so the upstream cause is not hidden by the answer.
+            log.warning(
+                "orphan_tool_calls",
+                count=len(synthesised),
+                tool_call_ids=synthesised,
+                trace_id=state.get("trace_id"),
+            )
+        if supplied:
+            log.warning(
+                "orphan_tool_messages",
+                count=len(supplied),
+                tool_call_ids=sorted(supplied),
                 trace_id=state.get("trace_id"),
             )
         return messages
@@ -1382,6 +1415,46 @@ class AgentRunner:
             limit_reason=result.get("limit_reason"),
         )
         return result
+
+
+def _missing_tool_message(call: dict[str, Any], state: AgentState) -> ToolMessage:
+    """A typed answer for a call that no recorded step answers.
+
+    **Why an answer at all, rather than dropping the call.** The assistant turn is the record of what the
+    model asked; rewriting it is a fabrication, and a strict provider requires the pairing either way. So
+    the call is answered with a result that says plainly that no result exists — never invented data.
+
+    **Why it cannot become evidence.** The answer goes into the prompt only. ``steps_taken`` is untouched
+    and ``_has_grounded_evidence`` reads steps, so a run that fetched nothing still looks like a run that
+    fetched nothing. Turning a missing result into "the tool returned nothing" is the defect this
+    avoids: the model would then answer from silence as if it had data.
+
+    The reason is drawn from state where state knows it, because "awaiting approval" and "the user
+    denied this" are different situations from "this call was never executed" — for the model and for
+    anyone reading the thread afterwards.
+    """
+    wanted = str(call.get("id"))
+    tool = str(call.get("name") or "")
+    pending = state.get("pending_approval") or {}
+    denied = {str(name) for name in (state.get("denied_tools") or [])}
+
+    if str(pending.get("tool_call_id") or "") == wanted:
+        code, message = (
+            "awaiting_approval",
+            "not executed: this call is waiting for a human decision",
+        )
+    elif tool and tool in denied:
+        code, message = "denied_by_user", "not executed: the user denied this tool for this run"
+    else:
+        code, message = "no_tool_result", "no result was recorded for this call"
+
+    return ToolMessage(
+        content=json.dumps(
+            {"ok": False, "error": {"code": code, "message": message}}, ensure_ascii=False
+        ),
+        tool_call_id=wanted,
+        name=tool or None,
+    )
 
 
 def _last_user_message(state: AgentState) -> str:
