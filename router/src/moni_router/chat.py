@@ -23,9 +23,11 @@ the cloud except the policy's explicit escalation.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from ipaddress import ip_address
 from types import MappingProxyType
 from typing import Any, Final
 
@@ -58,14 +60,177 @@ from moni_router.wire import (
 
 log = structlog.get_logger(__name__)
 
-#: Request-body fields that **only the local vLLM server accepts** (Step 2 of the empty-`respond`
-#: finding). Empty until a parameter is proven to fix the fault, and deliberately empty rather than
-#: speculative: every field here is a claim about what vLLM accepts, and a wrong one breaks the local
-#: path — which is also the degraded fallback when the cloud fails.
-#:
-#: The cloud call sites in `provider.py` never pass this, so a field added here cannot reach a hosted
-#: provider. `tests/unit/router/test_local_only_body.py` holds that down in both directions.
-LOCAL_ONLY_BODY: Final[Mapping[str, Any]] = MappingProxyType({})
+
+class PrimaryModelNotPrivateError(RuntimeError):
+    """The primary model is not on this machine, outside a dev stand. See `assert_primary_is_private`."""
+
+
+#: Hostname suffixes that are private by construction rather than by resolution.
+_PRIVATE_SUFFIXES: Final[tuple[str, ...]] = (".local", ".internal", ".localdomain", ".home.arpa")
+
+#: Names that mean "this machine" or "the docker host", which are private on a laptop and on a server.
+_PRIVATE_NAMES: Final[frozenset[str]] = frozenset({"localhost", "host.docker.internal"})
+
+
+def primary_host_concern(base_url: str) -> str | None:
+    """``None`` when the primary model's host is private, otherwise a short reason it is not.
+
+    **Why this matters enough to refuse a start.** The data classifier treats the primary path as the
+    *on-server* destination: it is where level A goes (finance, salaries, client PII, email and
+    WhatsApp bodies) and it is the fail-closed fallback for anything unclassified (§3.12). Pointing it
+    at a third-party endpoint therefore does two things silently:
+
+    * **level A leaves the host** — the classifier still labels it A, still routes it to "the primary
+      model", and the payloads go to somebody else;
+    * **level B stops being anonymised** — anonymisation runs on the cloud path only, so a B payload
+      sent down the primary path goes out in the clear.
+
+    And `ChatResult.destination` would still record ``local``, so the trace and the audit row would
+    assert a §3.4 property that is no longer true. On a dev stand with test data that is a reasonable
+    convenience; anywhere else it is the exact thing the routing rules exist to prevent.
+
+    The classification is deliberately conservative and does not resolve DNS: an IP literal is judged by
+    its address range, a name with no dot is a compose service name, and anything else — a dotted name
+    that is not an explicitly private suffix — counts as public.
+    """
+    from urllib.parse import urlparse
+
+    host = (urlparse(base_url).hostname or "").strip().lower()
+    if not host:
+        return "the URL has no host"
+
+    try:
+        address = ip_address(host)
+    except ValueError:
+        if host in _PRIVATE_NAMES or host.endswith(_PRIVATE_SUFFIXES) or "." not in host:
+            return None
+        return f"{host!r} is a resolvable name that is not private by suffix"
+
+    if address.is_loopback or address.is_private or address.is_link_local:
+        return None
+    return f"{host!r} is a public address"
+
+
+def assert_primary_is_private(base_url: str | None = None, *, moni_env: str | None = None) -> None:
+    """Refuse a non-private primary model outside dev; warn loudly inside it (§3.4, §3.12).
+
+    The same shape as the placeholder-credential refusal in the gateway: a state the process cannot
+    honour is one it must not serve on. ``MONI_ENV=dev`` is the documented escape, because a laptop
+    running the agent against a hosted model on test data is a legitimate thing to want — it just must
+    not be *quiet*, and it must not be inherited by a server stand.
+    """
+    source_url = base_url if base_url is not None else (os.environ.get("VLLM_BASE_URL") or "")
+    environment = (moni_env if moni_env is not None else (os.environ.get("MONI_ENV") or "")).strip()
+    if not source_url:
+        return
+
+    concern = primary_host_concern(source_url)
+    if concern is None:
+        return
+
+    consequences = (
+        "level-A data (finance, salaries, client PII, email and WhatsApp bodies) will be sent to that "
+        "host, because the classifier treats the primary path as the on-server destination; "
+        "level-B payloads will NOT be anonymised, because anonymisation runs on the cloud path only; "
+        "and the trace will still record destination=local"
+    )
+    if environment.lower() == "dev":
+        log.warning(
+            "primary_model_not_private",
+            base_url=source_url,
+            concern=concern,
+            moni_env=environment,
+            detail=f"allowed because MONI_ENV=dev, but note that {consequences}",
+        )
+        return
+
+    msg = (
+        f"refusing to start: VLLM_BASE_URL is {source_url} ({concern}), so {consequences}. "
+        "Set MONI_ENV=dev for a local stand with test data, or point the primary model at a private "
+        "address."
+    )
+    log.error("primary_model_not_private_refused", base_url=source_url, concern=concern)
+    raise PrimaryModelNotPrivateError(msg)
+
+
+class LocalBodyError(RuntimeError):
+    """A malformed primary-path request knob, raised rather than ignored — see `resolve_local_only_body`."""
+
+
+@dataclass(frozen=True)
+class _LocalEnvNames:
+    """The environment names the operator sets, as data so a test can assert them by string."""
+
+    #: Arbitrary request fields merged into the **primary** path's body (off by default).
+    extra_body: str = "VLLM_EXTRA_BODY_JSON"
+    #: Which token-cap field name to emit: `max_tokens` or `max_completion_tokens`.
+    max_tokens_field: str = "VLLM_MAX_TOKENS_FIELD"
+
+
+#: The operator-facing names, so no call site retypes a string.
+LOCAL_ENV: Final = _LocalEnvNames()
+
+#: The token-cap field names that are legal to emit. `max_completion_tokens` covers visible **and
+#: reasoning** tokens and is the documented replacement for `max_tokens`, which OpenAI documents as
+#: deprecated and "not compatible with o-series models" — so which name is legal is a property of the
+#: *model*, not of our code, and is therefore configurable rather than chosen here.
+TOKEN_FIELDS: Final[frozenset[str]] = frozenset({"max_tokens", "max_completion_tokens"})
+
+
+def resolve_local_only_body(env: dict[str, str] | None = None) -> Mapping[str, Any]:
+    """The extra request fields for the primary path, from ``VLLM_EXTRA_BODY_JSON``.
+
+    **Why this exists.** A model served on the primary path may reject a request the OpenAI shape
+    carries happily. The concrete case: an OpenAI reasoning model that rejects ``tools`` unless
+    ``reasoning_effort`` is ``"none"`` — verified with curl by the operator, whose endpoint returns a
+    tool call once that is set. Without a way to send it, the agent cannot run on such a model at all.
+
+    **Fail closed, never ignore.** A malformed value raises. Dropping it would reproduce exactly the
+    failure the knob exists to fix — the model rejects the tools — while the log says nothing, which is
+    the class of silent degradation this project keeps paying for. Absent or empty is the documented
+    default and means "send nothing extra".
+
+    **Primary path only.** The cloud call sites in ``provider.py`` never pass this, so a field set here
+    cannot reach a hosted provider. ``tests/unit/router/test_local_extras.py`` asserts that with the
+    variable actually set, because a leak only exists once somebody sets it.
+    """
+    source = env if env is not None else os.environ
+    raw = (source.get(LOCAL_ENV.extra_body) or "").strip()
+    if not raw:
+        return MappingProxyType({})
+    try:
+        parsed = json.loads(raw)
+    except ValueError as exc:
+        msg = (
+            f"{LOCAL_ENV.extra_body} is not valid JSON ({exc}). Fix it or unset it: a request field "
+            "that is silently dropped is the failure this knob exists to prevent."
+        )
+        raise LocalBodyError(msg) from exc
+    if not isinstance(parsed, dict):
+        msg = (
+            f"{LOCAL_ENV.extra_body} must be a JSON object of request fields, not "
+            f"{type(parsed).__name__}; these are merged into the request body."
+        )
+        raise LocalBodyError(msg)
+    return MappingProxyType({str(key): value for key, value in parsed.items()})
+
+
+def resolve_max_tokens_field(env: dict[str, str] | None = None) -> str:
+    """Which token-cap field name to emit, from ``VLLM_MAX_TOKENS_FIELD``.
+
+    Defaults to ``max_tokens`` so nothing changes for a vLLM server, and refuses an unknown name rather
+    than emitting something no server documents.
+    """
+    source = env if env is not None else os.environ
+    raw = (source.get(LOCAL_ENV.max_tokens_field) or "").strip() or "max_tokens"
+    if raw not in TOKEN_FIELDS:
+        msg = (
+            f"{LOCAL_ENV.max_tokens_field} is {raw!r}; expected one of {sorted(TOKEN_FIELDS)}. "
+            "Emitting an undocumented name would be rejected by the server with no local signal."
+        )
+        raise LocalBodyError(msg)
+    return raw
+
 
 #: Attempts for one **local** model call, the first included. A transient 5xx is re-sampled instead
 #: of failing the whole run.
@@ -308,8 +473,11 @@ async def _local_chat(
         temperature=temperature,
         max_tokens=max_tokens,
         stream=False,
-        # Local-only fields never reach the cloud (see `LOCAL_ONLY_BODY`).
-        local_only=LOCAL_ONLY_BODY,
+        # Resolved here rather than passed in, so every caller — and therefore every node — gets the
+        # same fields without having to remember. These never reach the cloud: the cloud body is built
+        # in `provider.py`, which does not read them.
+        local_only=resolve_local_only_body(env),
+        max_tokens_field=resolve_max_tokens_field(env),
     )
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
@@ -447,8 +615,11 @@ async def _local_stream(
         temperature=temperature,
         max_tokens=max_tokens,
         stream=True,
-        # Local-only fields never reach the cloud (see `LOCAL_ONLY_BODY`).
-        local_only=LOCAL_ONLY_BODY,
+        # Resolved here rather than passed in, so every caller — and therefore every node — gets the
+        # same fields without having to remember. These never reach the cloud: the cloud body is built
+        # in `provider.py`, which does not read them.
+        local_only=resolve_local_only_body(env),
+        max_tokens_field=resolve_max_tokens_field(env),
     )
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 

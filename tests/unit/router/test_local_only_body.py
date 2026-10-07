@@ -18,7 +18,6 @@ import json
 from typing import Any
 
 import httpx
-import pytest
 
 from moni_router import chat as chat_module
 from moni_router.policy import RunRouting, cloud_chat, route_request
@@ -27,11 +26,34 @@ from moni_router.wire import parse_completion
 
 from .helpers import completion, recording_client
 
-#: What every OpenAI-compatible provider documents. Anything outside this set is a claim that the
-#: provider accepts it, and this suite exists so that claim has to be made deliberately.
-PROVIDER_DOCUMENTED_FIELDS = frozenset(
-    {"model", "messages", "temperature", "max_tokens", "stream", "tools"}
-)
+#: What every OpenAI-compatible provider documents, **each with its justification**. Anything outside
+#: this set is a claim that the provider accepts it, and this suite exists so that claim has to be made
+#: deliberately — so the admission itself has to carry its evidence, and a test asserts it does.
+#:
+#: The two admissions added 2026-10-03 come from OpenAI's generated chat-completions schema
+#: (`openai-python/src/openai/types/chat/completion_create_params.py`, generated from their OpenAPI
+#: spec): ``reasoning_effort: Optional[ReasoningEffort]`` — "Constrains effort on reasoning for
+#: reasoning models", values `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` — and
+#: ``max_completion_tokens: Optional[int]`` — "An upper bound for the number of tokens that can be
+#: generated … including visible output tokens and reasoning tokens", which the same file documents as
+#: replacing ``max_tokens``, itself "now deprecated … and is not compatible with o-series models".
+#:
+#: **Admitting a field permits it; it does not add a way to send it.** Nothing in the cloud path sets
+#: ``reasoning_effort`` today, so this is a corrected fact about providers rather than a capability, and
+#: running the agent on such a model goes through the primary path's ``VLLM_EXTRA_BODY_JSON``.
+PROVIDER_DOCUMENTED_FIELDS: dict[str, str] = {
+    "model": "the served model id",
+    "messages": "the conversation",
+    "temperature": "sampling temperature",
+    "max_tokens": "token cap, deprecated but still accepted by most providers",
+    "max_completion_tokens": "token cap including reasoning tokens; OpenAI's documented replacement",
+    "stream": "server-sent events",
+    "tools": "function/tool declarations",
+    "reasoning_effort": "OpenAI documents it on chat completions for reasoning models",
+}
+
+#: Derived, so a lookup cannot drift from the mapping above.
+DOCUMENTED_NAMES = frozenset(PROVIDER_DOCUMENTED_FIELDS)
 
 
 def _cloud_routing(client: httpx.AsyncClient) -> RunRouting:
@@ -69,7 +91,7 @@ async def test_a_cloud_payload_carries_only_provider_documented_fields() -> None
     """Keyed on the destination, not on the helper: this is the body that reaches a provider."""
     body = await _send_to_cloud()
 
-    unexpected = set(body) - PROVIDER_DOCUMENTED_FIELDS
+    unexpected = set(body) - DOCUMENTED_NAMES
     assert unexpected == set(), (
         f"the cloud request carries {sorted(unexpected)}, which no provider documents. A field added "
         "to the shared `build_payload` reaches both paths; local-only fields must go through "
@@ -77,17 +99,14 @@ async def test_a_cloud_payload_carries_only_provider_documented_fields() -> None
     )
 
 
-async def test_a_local_only_field_reaches_the_local_request_and_never_the_cloud(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The mechanism itself, exercised with a sentinel rather than left vacuous.
+async def test_a_local_only_field_reaches_the_local_request_and_never_the_cloud() -> None:
+    """The mechanism itself, exercised with a real setting rather than left vacuous.
 
-    `LOCAL_ONLY_BODY` is empty today — deliberately, because Step 2 has not yet proven a parameter. An
-    assertion about an empty mapping would pass for the wrong reason, so the sentinel is injected: the
-    field must appear in the local body and must not appear in the cloud body.
+    The field now comes from `VLLM_EXTRA_BODY_JSON` — the operator's knob — so this drives the shipped
+    path rather than patching a module constant. An assertion about an unset variable would pass for the
+    wrong reason; the field must appear in the local body and must not appear in the cloud body.
     """
     sentinel = {"chat_template_kwargs": {"reasoning_effort": "low"}}
-    monkeypatch.setattr(chat_module, "LOCAL_ONLY_BODY", sentinel)
 
     # Local: the field is present.
     local_client, local_seen = recording_client(
@@ -104,17 +123,19 @@ async def test_a_local_only_field_reaches_the_local_request_and_never_the_cloud(
                 "VLLM_BASE_URL": "http://local.test/v1",
                 "VLLM_API_KEY": "k",
                 "VLLM_MODEL": "m",
+                "VLLM_EXTRA_BODY_JSON": json.dumps(sentinel),
             },
         )
     assert local_seen, "the local request was never made"
-    assert "chat_template_kwargs" in json.loads(local_seen[0].decode("utf-8")), (
-        "the local-only field did not reach the local request, so the seam does not work"
-    )
+    assert (
+        json.loads(local_seen[0].decode("utf-8"))["chat_template_kwargs"]
+        == sentinel["chat_template_kwargs"]
+    ), "the configured extra did not reach the primary request, so the knob does nothing"
 
-    # Cloud: the same field must not be there, even though the sentinel is still patched in.
+    # Cloud: the same field must not be there.
     body = await _send_to_cloud()
     assert "chat_template_kwargs" not in body, (
-        "a local-only field reached the cloud request — the leak this mechanism exists to prevent"
+        "a primary-path extra reached the cloud request — the leak this mechanism exists to prevent"
     )
 
 
@@ -137,3 +158,20 @@ def test_the_reasoning_length_is_recorded_and_its_text_is_not() -> None:
     assert secret_analysis not in result.model_dump_json(), (
         "the reasoning text is present in the result, and from there it can reach the trace or a user"
     )
+
+
+def test_every_admitted_cloud_field_carries_its_justification() -> None:
+    """A field is admitted on evidence, and the evidence is written down next to it.
+
+    This is the guard on the allowlist itself: adding a name to a set is a one-line change nobody
+    reviews, whereas adding it *with a reason* is a claim somebody can check. It also keeps the two
+    documented admissions above from being mistaken for capabilities we use.
+    """
+    empty = [
+        name for name, reason in PROVIDER_DOCUMENTED_FIELDS.items() if len(reason.strip()) < 15
+    ]
+
+    assert empty == [], f"{empty} are admitted without a usable justification"
+    assert DOCUMENTED_NAMES == frozenset(PROVIDER_DOCUMENTED_FIELDS), "the derived set has drifted"
+    # The two fields an OpenAI reasoning model needs, admitted because OpenAI documents them.
+    assert {"reasoning_effort", "max_completion_tokens"} <= DOCUMENTED_NAMES

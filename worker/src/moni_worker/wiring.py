@@ -145,8 +145,14 @@ def build_worker_context(
     from moni_gateway.config import get_settings
     from moni_gateway.db import create_engine, session_factory_for
     from moni_gateway.policy_client import GatewayApprovalClient, GatewayPolicyClient
+
+    # The worker handles inbound mail bodies, which are level A, so the same check the gateway makes
+    # applies here — arguably more so, since nobody is watching a background run.
+    from moni_router.chat import assert_primary_is_private
     from moni_worker.dedup import MessageLedger
     from moni_worker.gate import RedisUserGate
+
+    assert_primary_is_private()
 
     validate_trigger_identity(config)
 

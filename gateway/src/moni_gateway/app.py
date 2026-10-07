@@ -142,6 +142,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Fail closed on placeholder credentials (§3.11, §3.12). The dev stack sets
     # MONI_ENV=dev explicitly; everywhere else a `change-me*` value is a hard stop,
     # so a copy-pasted .env.example cannot become a running deployment.
+    # The primary model must actually be on this machine (§3.4). Checked here, next to the credential
+    # refusal, because both are "a state this process cannot honour".
+    from moni_router.chat import assert_primary_is_private
+
+    assert_primary_is_private(moni_env=settings.environment)
+
     offenders = settings.insecure_placeholders()
     if offenders and not settings.is_dev:
         msg = (

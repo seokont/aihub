@@ -216,12 +216,13 @@ def build_payload(
     evidence: str,
     extra: dict[str, object],
     variant: str | None = None,
+    max_tokens_field: str = "max_tokens",
 ) -> dict[str, object]:
     """The request body for one node, in the chosen message shape."""
     payload: dict[str, object] = {
         "model": model,
         "messages": build_messages(variant or node, node, evidence),
-        "max_tokens": max_tokens,
+        max_tokens_field: max_tokens,
         "temperature": 0,
         "stream": False,
     }
@@ -250,6 +251,11 @@ def classify(choice: dict[str, object]) -> tuple[str, dict[str, object]]:
 
     if content.strip():
         return "CONTENT_OK", facts
+    if message.get("tool_calls"):
+        # A valid tool-call response has empty `content` (and often empty reasoning too), so without
+        # this it was reported as NO_CHANNELS — which made the `act` probe, the one node whose whole
+        # output *is* a tool call, meaningless for the case that matters most.
+        return "TOOL_CALL", facts
     if reasoning.strip():
         # The text exists, in a channel the router does not read. This is H1.
         return "REASONING_ONLY", facts
@@ -296,6 +302,17 @@ def main(argv: list[str] | None = None) -> int:
         "--dump-prompt",
         action="store_true",
         help="print the exact messages sent, so 'which prompt produced this' is never inference",
+    )
+    parser.add_argument(
+        "--max-tokens-field",
+        choices=("max_tokens", "max_completion_tokens"),
+        default="max_tokens",
+        help=(
+            "which token-cap field to send. OpenAI documents max_tokens as deprecated and 'not "
+            "compatible with o-series models', and max_completion_tokens as bounding visible *and "
+            "reasoning* tokens; the agent has the same switch as VLLM_MAX_TOKENS_FIELD. Exactly one is "
+            "ever sent, because sending both is rejected."
+        ),
     )
     parser.add_argument(
         "--reasoning-effort",
@@ -353,6 +370,7 @@ def main(argv: list[str] | None = None) -> int:
         evidence=evidence,
         extra=extra,
         variant=variant,
+        max_tokens_field=args.max_tokens_field,
     )
 
     if args.dump_prompt:
@@ -370,7 +388,10 @@ def main(argv: list[str] | None = None) -> int:
         print()
 
     print(f"probe: {base_url}/chat/completions")
-    print(f"  model={model}  node={args.node}  variant={variant}  max_tokens={max_tokens}")
+    print(
+        f"  model={model}  node={args.node}  variant={variant}  "
+        f"{args.max_tokens_field}={max_tokens}"
+    )
     print(f"  attempts={args.repeat}")
     print(
         f"  evidence: {'file ' + args.evidence_file if args.evidence_file else 'synthetic fixture'}"
@@ -491,6 +512,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  ok: worst case {ordered[-1]} leaves {headroom:.0f}% of the budget unused")
 
     print("\nreading")
+    if counts.get("TOOL_CALL"):
+        print(
+            f"  {counts['TOOL_CALL']} attempt(s) returned a TOOL CALL with no text — the expected shape "
+            "for `act`, and the thing a reasoning model with a too-low reasoning_effort rejects."
+        )
     if counts.get("REASONING_ONLY"):
         print("  H1 is real: the text arrives in a reasoning channel the router does not read.")
         print("  A blind retry would reproduce it. Fix the channel or the request parameters.")

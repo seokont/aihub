@@ -352,6 +352,13 @@ services:
       VLLM_BASE_URL: ${VLLM_BASE_URL_FOR_CONTAINERS:-http://host.docker.internal:8001/v1}
       VLLM_API_KEY: ${VLLM_API_KEY:?VLLM_API_KEY must be set in .env (see .env.example)}
       VLLM_MODEL: ${VLLM_MODEL:-corporate-main}
+      # Primary-model request knobs, both off by default (see .env.example).
+      # `VLLM_EXTRA_BODY_JSON` carries fields the served model needs beyond the OpenAI
+      # shape — the known case is reasoning_effort for a model that rejects tools without it;
+      # `VLLM_MAX_TOKENS_FIELD` picks max_tokens vs max_completion_tokens, which is a property
+      # of the model (OpenAI deprecates max_tokens and excludes o-series models).
+      VLLM_EXTRA_BODY_JSON: ${VLLM_EXTRA_BODY_JSON:-}
+      VLLM_MAX_TOKENS_FIELD: ${VLLM_MAX_TOKENS_FIELD:-}
       # Tracing (§3.8). Optional: with no public key the agent's tracer is a no-op.
       LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse:3000}
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
@@ -681,6 +688,13 @@ services:
       VLLM_BASE_URL: ${VLLM_BASE_URL_FOR_CONTAINERS:-http://host.docker.internal:8001/v1}
       VLLM_API_KEY: ${VLLM_API_KEY:?VLLM_API_KEY must be set in .env (see .env.example)}
       VLLM_MODEL: ${VLLM_MODEL:-corporate-main}
+      # Primary-model request knobs, both off by default (see .env.example).
+      # `VLLM_EXTRA_BODY_JSON` carries fields the served model needs beyond the OpenAI
+      # shape — the known case is reasoning_effort for a model that rejects tools without it;
+      # `VLLM_MAX_TOKENS_FIELD` picks max_tokens vs max_completion_tokens, which is a property
+      # of the model (OpenAI deprecates max_tokens and excludes o-series models).
+      VLLM_EXTRA_BODY_JSON: ${VLLM_EXTRA_BODY_JSON:-}
+      VLLM_MAX_TOKENS_FIELD: ${VLLM_MAX_TOKENS_FIELD:-}
       LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse:3000}
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}

@@ -128,6 +128,7 @@ def build_payload(
     max_tokens: int,
     stream: bool,
     local_only: Mapping[str, Any] | None = None,
+    max_tokens_field: str = "max_tokens",
 ) -> dict[str, Any]:
     """The request body for ``POST /chat/completions``.
 
@@ -145,7 +146,11 @@ def build_payload(
         "model": model,
         "messages": to_wire_messages(messages),
         "temperature": temperature,
-        "max_tokens": max_tokens,
+        # Exactly ONE token-cap field, named by the caller. OpenAI documents `max_tokens` as deprecated
+        # and "not compatible with o-series models", while `max_completion_tokens` bounds visible *and
+        # reasoning* tokens — so which is legal is a property of the model. Emitting both would be
+        # rejected, which is why this is a name substitution rather than an extra field.
+        max_tokens_field: max_tokens,
         "stream": stream,
     }
     if tools:
