@@ -358,6 +358,9 @@ services:
       # `VLLM_MAX_TOKENS_FIELD` picks max_tokens vs max_completion_tokens, which is a property
       # of the model (OpenAI deprecates max_tokens and excludes o-series models).
       VLLM_EXTRA_BODY_JSON: ${VLLM_EXTRA_BODY_JSON:-}
+      # Merged only when the request carries tools: `parallel_tool_calls` is rejected by OpenAI
+      # on a request with no tools, and plan/verify/respond carry none.
+      VLLM_EXTRA_BODY_WITH_TOOLS_JSON: ${VLLM_EXTRA_BODY_WITH_TOOLS_JSON:-}
       VLLM_MAX_TOKENS_FIELD: ${VLLM_MAX_TOKENS_FIELD:-}
       # Tracing (§3.8). Optional: with no public key the agent's tracer is a no-op.
       LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse:3000}
@@ -694,6 +697,9 @@ services:
       # `VLLM_MAX_TOKENS_FIELD` picks max_tokens vs max_completion_tokens, which is a property
       # of the model (OpenAI deprecates max_tokens and excludes o-series models).
       VLLM_EXTRA_BODY_JSON: ${VLLM_EXTRA_BODY_JSON:-}
+      # Merged only when the request carries tools: `parallel_tool_calls` is rejected by OpenAI
+      # on a request with no tools, and plan/verify/respond carry none.
+      VLLM_EXTRA_BODY_WITH_TOOLS_JSON: ${VLLM_EXTRA_BODY_WITH_TOOLS_JSON:-}
       VLLM_MAX_TOKENS_FIELD: ${VLLM_MAX_TOKENS_FIELD:-}
       LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse:3000}
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}

@@ -168,6 +168,10 @@ class _LocalEnvNames:
 
     #: Arbitrary request fields merged into the **primary** path's body (off by default).
     extra_body: str = "VLLM_EXTRA_BODY_JSON"
+    #: Fields merged only when the request carries `tools`. Some fields are illegal without them:
+    #: `parallel_tool_calls` is rejected by OpenAI on a request that sends no tools, and the extras
+    #: knob applies to every request — including `plan`, `verify` and `respond`, which carry none.
+    tool_only_body: str = "VLLM_EXTRA_BODY_WITH_TOOLS_JSON"
     #: Which token-cap field name to emit: `max_tokens` or `max_completion_tokens`.
     max_tokens_field: str = "VLLM_MAX_TOKENS_FIELD"
 
@@ -182,7 +186,33 @@ LOCAL_ENV: Final = _LocalEnvNames()
 TOKEN_FIELDS: Final[frozenset[str]] = frozenset({"max_tokens", "max_completion_tokens"})
 
 
-def resolve_local_only_body(env: dict[str, str] | None = None) -> Mapping[str, Any]:
+def _parse_body(raw: str, name: str) -> dict[str, Any]:
+    """One extras value: a JSON object, or a refusal explaining which variable is wrong.
+
+    Shared by both knobs so a malformed value is refused identically whichever one it came from.
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except ValueError as exc:
+        msg = (
+            f"{name} is not valid JSON ({exc}). Fix it or unset it: a request field that is silently "
+            "dropped is the failure this knob exists to prevent."
+        )
+        raise LocalBodyError(msg) from exc
+    if not isinstance(parsed, dict):
+        msg = (
+            f"{name} must be a JSON object of request fields, not {type(parsed).__name__}; these are "
+            "merged into the request body."
+        )
+        raise LocalBodyError(msg)
+    return {str(key): value for key, value in parsed.items()}
+
+
+def resolve_local_only_body(
+    env: dict[str, str] | None = None, *, with_tools: bool = False
+) -> Mapping[str, Any]:
     """The extra request fields for the primary path, from ``VLLM_EXTRA_BODY_JSON``.
 
     **Why this exists.** A model served on the primary path may reject a request the OpenAI shape
@@ -198,26 +228,24 @@ def resolve_local_only_body(env: dict[str, str] | None = None) -> Mapping[str, A
     **Primary path only.** The cloud call sites in ``provider.py`` never pass this, so a field set here
     cannot reach a hosted provider. ``tests/unit/router/test_local_extras.py`` asserts that with the
     variable actually set, because a leak only exists once somebody sets it.
+
+    **Conditional fields.** `with_tools` selects a second list, merged on top when the request sends
+    `tools`. Some fields are only legal in that case — OpenAI rejects `parallel_tool_calls` with
+    "'parallel_tool_calls' is only allowed when 'tools' are specified" — and `plan`, `verify` and
+    `respond` send none, so a global field cannot express it. The specific list wins on a conflict, so a
+    tool-only value can correct a global one without splitting the general knob.
     """
     source = env if env is not None else os.environ
-    raw = (source.get(LOCAL_ENV.extra_body) or "").strip()
-    if not raw:
+    merged = _parse_body((source.get(LOCAL_ENV.extra_body) or "").strip(), LOCAL_ENV.extra_body)
+    if with_tools:
+        merged.update(
+            _parse_body(
+                (source.get(LOCAL_ENV.tool_only_body) or "").strip(), LOCAL_ENV.tool_only_body
+            )
+        )
+    if not merged:
         return MappingProxyType({})
-    try:
-        parsed = json.loads(raw)
-    except ValueError as exc:
-        msg = (
-            f"{LOCAL_ENV.extra_body} is not valid JSON ({exc}). Fix it or unset it: a request field "
-            "that is silently dropped is the failure this knob exists to prevent."
-        )
-        raise LocalBodyError(msg) from exc
-    if not isinstance(parsed, dict):
-        msg = (
-            f"{LOCAL_ENV.extra_body} must be a JSON object of request fields, not "
-            f"{type(parsed).__name__}; these are merged into the request body."
-        )
-        raise LocalBodyError(msg)
-    return MappingProxyType({str(key): value for key, value in parsed.items()})
+    return MappingProxyType(merged)
 
 
 def resolve_max_tokens_field(env: dict[str, str] | None = None) -> str:
@@ -481,7 +509,7 @@ async def _local_chat(
         # Resolved here rather than passed in, so every caller — and therefore every node — gets the
         # same fields without having to remember. These never reach the cloud: the cloud body is built
         # in `provider.py`, which does not read them.
-        local_only=resolve_local_only_body(env),
+        local_only=resolve_local_only_body(env, with_tools=bool(tools)),
         max_tokens_field=resolve_max_tokens_field(env),
     )
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
@@ -636,7 +664,7 @@ async def _local_stream(
         # Resolved here rather than passed in, so every caller — and therefore every node — gets the
         # same fields without having to remember. These never reach the cloud: the cloud body is built
         # in `provider.py`, which does not read them.
-        local_only=resolve_local_only_body(env),
+        local_only=resolve_local_only_body(env, with_tools=bool(tools)),
         max_tokens_field=resolve_max_tokens_field(env),
     )
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}

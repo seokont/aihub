@@ -15,7 +15,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-KNOBS = ("VLLM_EXTRA_BODY_JSON", "VLLM_MAX_TOKENS_FIELD")
+KNOBS = ("VLLM_EXTRA_BODY_JSON", "VLLM_EXTRA_BODY_WITH_TOOLS_JSON", "VLLM_MAX_TOKENS_FIELD")
 
 #: The two services that call the primary model: the gateway for interactive runs, the worker for
 #: triggered ones. A triggered run handles mail bodies, so it needs the knobs at least as much.
