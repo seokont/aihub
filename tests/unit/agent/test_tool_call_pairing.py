@@ -194,8 +194,7 @@ def test_the_unexecuted_call_is_answered_with_a_typed_reason_not_invented_data()
     # it would test the normal path and never look at the placeholder.
     answer = _answer(wire, 1)
 
-    assert answer["ok"] is False
-    assert answer["error"]["code"] == "no_tool_result"
+    assert answer["code"] == "no_tool_result"
     assert "call_b" not in json.dumps(answer), "the answer must not fabricate a result"
 
 
@@ -206,7 +205,7 @@ def test_a_call_with_no_step_at_all_is_answered() -> None:
     wire = _wire(state)
 
     assert pairing_problems(wire) == []
-    assert _answer(wire)["error"]["code"] == "no_tool_result"
+    assert _answer(wire)["code"] == "no_tool_result"
 
 
 def test_a_pending_approval_call_is_answered_with_that_reason() -> None:
@@ -219,7 +218,7 @@ def test_a_pending_approval_call_is_answered_with_that_reason() -> None:
     answer = _answer(wire)
 
     assert pairing_problems(wire) == []
-    assert answer["error"]["code"] == "awaiting_approval"
+    assert answer["code"] == "awaiting_approval"
 
 
 def test_a_denied_tool_call_is_answered_with_that_reason() -> None:
@@ -232,7 +231,7 @@ def test_a_denied_tool_call_is_answered_with_that_reason() -> None:
     answer = _answer(wire)
 
     assert pairing_problems(wire) == []
-    assert answer["error"]["code"] == "denied_by_user"
+    assert answer["code"] == "denied_by_user"
 
 
 def test_a_duplicated_call_id_across_turns_is_answered_in_both() -> None:

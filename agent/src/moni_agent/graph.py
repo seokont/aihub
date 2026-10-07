@@ -62,7 +62,7 @@ from moni_agent.tracing import NoOpTracer, Tracer
 from moni_router.anonymizer import Anonymizer
 from moni_router.chat import DEFAULT_MAX_TOKENS
 from moni_router.classifier import ContextPart, declare_tool_result
-from moni_router.models import ChatResult
+from moni_router.models import ChatResult, ToolCall, ToolSpec
 from moni_router.policy import RunRouting
 from moni_router.provider import CloudConfig
 
@@ -631,6 +631,59 @@ class AgentRunner:
                         error={
                             "code": "tool_not_allowed",
                             "message": f"{call.name} is not available to this user",
+                        },
+                        attempts=0,
+                    ),
+                ],
+            }
+
+        # Required arguments, checked *here* rather than in the tool handler, and before anything
+        # downstream is asked about this call -- not the policy engine, not a human. Validating in the
+        # handler cannot fix the finding by construction: the handler runs after the approval pause, so
+        # the person has already been asked to confirm. The finding: for "создай задачу" the model called
+        # `create_project_task` with `name`, `assignee_query`, `deadline` and `description` all empty, and
+        # the run paused for approval on an **empty write**.
+        #
+        # The refusal is typed and carries the missing names, because the point is to make the model ask
+        # for the details: the error travels back as the answer to this call, so the next turn is its
+        # opportunity to ask. A silent skip would leave it believing it had tried something.
+        missing = _missing_required(call, specs)
+        if missing is None:
+            # No advertised schema for an allowed name, so there is no `required` list to check. Refusing
+            # on that basis would reject calls we cannot judge; the MCP server validates its own
+            # arguments, and `tool_not_allowed` already covers the case that matters most.
+            log.warning("tool_spec_missing", tool=call.name, trace_id=state.get("trace_id"))
+        elif missing:
+            log.warning(
+                "tool_call_missing_required_arguments",
+                tool=call.name,
+                missing=missing,
+                trace_id=state.get("trace_id"),
+            )
+            self._tracer.node_span(
+                "act", state, {"step": step, "tool": call.name, "call": "missing_arguments"}
+            )
+            return {
+                **calls,
+                "step_count": step,
+                "no_tool_streak": int(state.get("no_tool_streak") or 0) + 1,
+                "messages": [_assistant_message(result)],
+                "steps_taken": [
+                    *state.get("steps_taken", []),
+                    ToolResult(
+                        step=step,
+                        tool=call.name,
+                        tool_call_id=str(call.id),
+                        arguments=dict(call.arguments),
+                        ok=False,
+                        executed=False,
+                        error={
+                            "code": "missing_required_arguments",
+                            "message": (
+                                f"{call.name} needs {', '.join(missing)} and they are empty; ask the "
+                                "user for the details before calling it again"
+                            ),
+                            "missing": missing,
                         },
                         attempts=0,
                     ),
@@ -1449,12 +1502,43 @@ def _missing_tool_message(call: dict[str, Any], state: AgentState) -> ToolMessag
         code, message = "no_tool_result", "no result was recorded for this call"
 
     return ToolMessage(
-        content=json.dumps(
-            {"ok": False, "error": {"code": code, "message": message}}, ensure_ascii=False
-        ),
+        # The bare error dict, because that is what `_tool_message` renders for a *real* failed step:
+        # one shape for "the tool did not answer" whichever way the failure arose.
+        content=json.dumps({"code": code, "message": message}, ensure_ascii=False),
         tool_call_id=wanted,
         name=tool or None,
     )
+
+
+def _is_blank(value: Any) -> bool:
+    """True for a value that carries nothing: absent, ``None``, or whitespace-only text.
+
+    ``"   "`` is what a model produces when it has decided to fill a field in and has nothing to put
+    there. Treating it as a value creates a task titled three spaces.
+    """
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    return False
+
+
+def _missing_required(call: ToolCall, specs: Sequence[ToolSpec]) -> list[str] | None:
+    """Required parameters the call left empty, in declaration order; ``None`` if the schema is unknown.
+
+    ``None`` rather than ``[]`` because the two are different facts and the caller treats them
+    differently: "this call is complete" and "there is no schema here to check against". Collapsing them
+    would either refuse calls we cannot judge, or accept them while looking as though they had been
+    checked.
+    """
+    for spec in specs:
+        if spec.name == call.name:
+            return [
+                parameter.name
+                for parameter in spec.parameters
+                if parameter.required and _is_blank(call.arguments.get(parameter.name))
+            ]
+    return None
 
 
 def _last_user_message(state: AgentState) -> str:
