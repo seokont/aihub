@@ -44,6 +44,11 @@ from moni_router.classifier import (
     compose,
     normalise_level,
 )
+from moni_router.diagnostics import (
+    reason_from_response,
+    safe_body,
+    status_and_reason,
+)
 from moni_router.models import ChatResult, StreamChunk, ToolSpec
 from moni_router.policy import Route, RunRouting, cloud_chat, cloud_stream, route
 from moni_router.wire import (
@@ -517,7 +522,20 @@ async def _local_chat(
         msg = f"model server error ({response.status_code})"
         raise ModelUnavailable(msg)
     if response.status_code >= 400:
-        msg = f"model rejected the request ({response.status_code})"
+        # A rejected request is our request being wrong, in the provider's own words. The body is
+        # logged here and deliberately not put in the exception: it can quote the request, and an
+        # exception message travels to callers, logs and eventually a UI (§3.11).
+        #
+        # This *is* the fix for "the provider's error body is not logged": the loop above breaks out on
+        # any status below 500, so a 4xx never reached `_log_and_back_off` and its body was discarded —
+        # which is why a 400 needed a code read to explain.
+        log.error(
+            "model_request_rejected",
+            status=response.status_code,
+            retryable=False,
+            body=safe_body(response.text),
+        )
+        msg = f"model rejected the request ({status_and_reason(response.status_code, reason_from_response(response))})"
         raise RouterError(msg)
 
     try:
@@ -662,7 +680,20 @@ async def _local_stream(
             raise ModelUnavailable(msg)
         try:
             if response.status_code >= 400:
-                msg = f"model rejected the streaming request ({response.status_code})"
+                # The body of a streamed response is not read yet, so it has to be pulled before it can
+                # be logged; `response.text` on an unread stream raises.
+                await response.aread()
+                log.error(
+                    "model_request_rejected",
+                    status=response.status_code,
+                    retryable=False,
+                    streaming=True,
+                    body=safe_body(response.text),
+                )
+                msg = (
+                    "model rejected the streaming request "
+                    f"({status_and_reason(response.status_code, reason_from_response(response))})"
+                )
                 raise ModelUnavailable(msg)
             async for chunk in parse_stream_lines(response.aiter_lines()):
                 yield chunk

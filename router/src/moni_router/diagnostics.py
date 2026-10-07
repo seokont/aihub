@@ -51,6 +51,60 @@ SAFE_VALUE_RE: Final[re.Pattern[str]] = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 #: How long a discriminator may be. API codes are short; a longer value is prose or a paste.
 MAX_REASON_CHARS: Final = 64
 
+#: How much of a rejected request's body may be logged. Enough for an OpenAI error object, which is
+#: where the offending field is named, and short enough that a gateway's HTML error page cannot flood
+#: the log.
+MAX_BODY_CHARS: Final = 500
+
+#: A run of characters long enough and mixed enough to be a credential rather than prose. Matches the
+#: same character class as `SAFE_VALUE_RE`, but *anywhere* in the text rather than anchored, because a
+#: provider quotes the offending value inside a sentence.
+_TOKEN_LIKE_RE: Final = re.compile(r"[A-Za-z0-9_\-]{20,}")
+
+#: Explicit credential shapes, so a short one is still masked. Two families, and the first attempt at
+#: this over-reached: treating *any* underscore as credential-shaped redacted `max_completion_tokens`
+#: and `unsupported_parameter` — the two strings the log line exists to convey. A rule that hides the
+#: diagnostic is worse than the leak it prevents, so the prefix form requires a separator (`api_key=`)
+#: and the assignment form requires `=`/`:` rather than a space.
+_CREDENTIAL_PREFIX_RE: Final = re.compile(
+    r"(?:Bearer\s+\S+"
+    r"|\b(?:sk|gsk|pk|xox[baprs])[-_][A-Za-z0-9_-]{8,}"
+    r"|(?:api[_-]?key|token|secret|password)\s*[:=]\s*\S+)",
+    re.IGNORECASE,
+)
+
+
+def safe_body(text: str) -> str:
+    """A provider's error body, trimmed for a log line and with credential-shaped values masked.
+
+    **Why the body is worth logging at all.** It is the provider naming the field it rejected —
+    ``"Unsupported parameter: 'max_tokens' is not supported with this model. Use
+    'max_completion_tokens' instead."`` The status alone ("model rejected the request (400)") costs a
+    code read to interpret, and cost one in practice.
+
+    **Why it is masked.** A provider body can quote the request back, so §3.11 applies to a log line
+    exactly as it applies to an audit row: a value that is credential-shaped is replaced whatever it
+    is. Prose survives — ``invalid api key`` stays readable — because over-redacting turns the log into
+    another thing nobody can use.
+    """
+    collapsed = " ".join((text or "").split())
+    masked = _CREDENTIAL_PREFIX_RE.sub("<redacted>", collapsed)
+
+    def _mask(match: re.Match[str]) -> str:
+        value = match.group(0)
+        # A long run is only token-shaped if it is not an ordinary word: a 20+ character English noun
+        # A long run is credential-shaped when it mixes digits with case, or when it is simply long
+        # enough that prose is implausible (a hex digest). Underscores and dashes prove nothing:
+        # snake_case identifiers are exactly what a provider's error body is made of.
+        has_digit = any(char.isdigit() for char in value)
+        mixed_case = any(char.islower() for char in value) and any(char.isupper() for char in value)
+        looks_secret = (has_digit and mixed_case) or len(value) >= 32
+        return "<redacted>" if looks_secret else value
+
+    masked = _TOKEN_LIKE_RE.sub(_mask, masked)
+    return masked[:MAX_BODY_CHARS]
+
+
 #: The value returned when no safe discriminator could be found. Callers append the status code.
 NO_REASON: Final = ""
 
@@ -123,11 +177,13 @@ def status_and_reason(status: int, reason: str = "") -> str:
 
 
 __all__ = [
+    "MAX_BODY_CHARS",
     "MAX_REASON_CHARS",
     "NO_REASON",
     "SAFE_FIELD_PATHS",
     "SAFE_VALUE_RE",
     "reason_from_response",
+    "safe_body",
     "safe_reason",
     "status_and_reason",
 ]

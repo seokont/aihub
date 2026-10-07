@@ -39,6 +39,13 @@ PHASE1_LEVEL: Final[DataLevel] = "A"
 Destination = Literal["local", "cloud"]
 
 
+#: The JSON Schema type vocabulary a tool parameter may declare. Anything else is rejected when the
+#: schema is built, rather than sent and rejected by a provider.
+JSON_SCHEMA_TYPES: Final[frozenset[str]] = frozenset(
+    {"string", "number", "integer", "boolean", "object", "array", "null"}
+)
+
+
 class ToolParameter(BaseModel):
     """One parameter of a tool, as advertised to the model."""
 
@@ -62,6 +69,18 @@ class ToolSpec(BaseModel):
         """The ``tools=[...]`` entry for an OpenAI-compatible endpoint."""
         properties: dict[str, Any] = {}
         for parameter in self.parameters:
+            if parameter.type not in JSON_SCHEMA_TYPES:
+                # Fail closed at the emission point. Forwarding an unknown name is what makes this
+                # defect class expensive: a permissive server renders the schema into its prompt and
+                # never validates it, so a bad type produces no local signal and surfaces later as a
+                # 400 from whichever strict endpoint someone tries next.
+                msg = (
+                    f"tool {self.name!r} declares parameter {parameter.name!r} with type "
+                    f"{parameter.type!r}, which is not a JSON Schema type "
+                    f"({', '.join(sorted(JSON_SCHEMA_TYPES))}). Fix the declaration: a model that "
+                    "validates the schema rejects the whole request, not just this parameter."
+                )
+                raise ValueError(msg)
             schema: dict[str, Any] = {"type": parameter.type}
             if parameter.description:
                 schema["description"] = parameter.description
