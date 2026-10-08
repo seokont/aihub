@@ -22,11 +22,20 @@ security properties the phase is accepted on:
 * **de-anonymisation replaces only placeholders it minted.** A model that invents ``{CLIENT_9}``
   is left alone *and* counted. Resolving an invented placeholder to "something arbitrary" would be
   a fabrication, and silently dropping it would hide a model that is confused about its own input.
+
+**What this module does not reach.** An entity the seeder did not see and no pattern matches stays in
+the text: a reference derived from a client name (``client_ref: "ROMASHKA-2026"``) is the ordinary case,
+because an ERP is full of fields we cannot name from here. The audit therefore records
+``anonymised=true`` as a statement that **this mechanism ran**, never that the payload carries no
+identifying data, and the limit is written down here rather than implied by the name. Anything leaving
+the host is anonymised by mechanism; that is a different claim from the payload being clean, and the two
+must not be conflated in a warning, a reason string or a report.
 """
 
 from __future__ import annotations
 
 import copy
+import json
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any, Final
@@ -138,6 +147,22 @@ def _is_replaceable(value: str, *, category: str) -> bool:
         return False
     # An empty Odoo many2one renders as "" or "False"; neither is an entity.
     return text.lower() not in {"false", "none", "null"}
+
+
+def _parse_json_document(text: str) -> Any | None:
+    """The parsed document when `text` is a JSON object or array, else None.
+
+    Only containers: a bare ``"42"`` or ``"true"`` is text that happens to look like a scalar, and
+    treating it as a document would change its type for no gain.
+    """
+    stripped = text.strip()
+    if len(stripped) < 2 or stripped[0] not in "{[":
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, (dict, list)) else None
 
 
 class Anonymizer:
@@ -266,6 +291,50 @@ class Anonymizer:
         self._discover(text)
         return self._replace(text)
 
+    def anonymize_value(self, node: Any) -> Any:
+        """Substitute entities through an arbitrary structure, returning it with the same shape.
+
+        **Why this exists.** Tool results reach the conversation as ``json.dumps`` strings. Substituting
+        into that text replaced a number with a bare placeholder -- ``"amount_total": {AMOUNT_1}`` -- and
+        the document stopped parsing. That was live on the level-B cloud path, not hypothetical: any tool
+        result whose numbers the patterns recognise arrived at the provider as malformed JSON.
+
+        **Why it cannot simply walk the structure as it is.** The in-place pass visits strings, so a
+        numeric scalar is never rendered and the ``AMOUNT`` pattern never sees it: parsing, substituting
+        and serialising afterwards keeps the JSON valid and leaves the amount **in the payload**. A
+        visible breakage traded for an invisible leak is the worse of the two, which is why scalars are
+        rendered to text for discovery and substitution here, and a replaced scalar comes back as the
+        placeholder *string*. An untouched scalar keeps its original type, so ``{"id": 42}`` stays an
+        int rather than becoming ``"42"``.
+
+        Keys are substituted too. A response grouped by client name carries the name as a **key**, which
+        the value-only pass could not see at all.
+        """
+        if isinstance(node, dict):
+            walked: dict[Any, Any] = {}
+            for key, value in node.items():
+                new_key = self.anonymize_value(key) if isinstance(key, str) else key
+                walked[new_key] = self.anonymize_value(value)
+            return walked
+        if isinstance(node, list):
+            return [self.anonymize_value(item) for item in node]
+        if isinstance(node, tuple):
+            return tuple(self.anonymize_value(item) for item in node)
+        if isinstance(node, str):
+            document = _parse_json_document(node)
+            if document is not None:
+                # Serialise *after* substituting: a numeric value becomes "{AMOUNT_1}", not a bare token
+                # that makes the document unparseable.
+                return json.dumps(self.anonymize_value(document), ensure_ascii=False)
+            return self._replace(node)
+        if node is None or isinstance(node, bool):
+            return node
+        if isinstance(node, (int, float)):
+            text = str(node)
+            replaced = self._replace(text)
+            return replaced if replaced != text else node
+        return node
+
     def anonymize_messages(self, messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         """Anonymise a whole wire payload, in two passes over all of it.
 
@@ -297,28 +366,42 @@ class Anonymizer:
             self._discover(node)
             return
         if isinstance(node, Mapping):
-            for value in node.values():
+            for key, value in node.items():
+                if isinstance(key, str):
+                    # A key can carry a name (a response grouped by client), and the value-only walk
+                    # could not see it at all.
+                    self.reserve(key)
+                    self._discover(key)
                 self._collect(value)
             return
         if isinstance(node, (list, tuple)):
             for item in node:
                 self._collect(item)
+            return
+        if isinstance(node, (int, float)) and not isinstance(node, bool):
+            # Rendered so the patterns can see it: `152340.5` is an amount whether it arrives as a number
+            # or as text, and the in-place pass would otherwise walk straight past it.
+            text = str(node)
+            self.reserve(text)
+            self._discover(text)
 
     def _substitute_in_place(self, node: Any) -> None:
-        """Replace entities in place, so a nested payload keeps its shape and its key order."""
+        """Replace entities in place, so a nested payload keeps its shape and its key order.
+
+        Delegates to :meth:`anonymize_value` rather than replacing string values here: that is the method
+        that renders scalars, walks keys and keeps a JSON document parseable, and two implementations of
+        "what counts as substitutable" is how the two passes drift apart.
+        """
         if isinstance(node, dict):
             for key, value in list(node.items()):
-                if isinstance(value, str):
-                    node[key] = self._replace(value)
-                else:
-                    self._substitute_in_place(value)
+                new_key = self.anonymize_value(key) if isinstance(key, str) else key
+                if new_key != key:
+                    del node[key]
+                node[new_key] = self.anonymize_value(value)
             return
         if isinstance(node, list):
             for index, item in enumerate(node):
-                if isinstance(item, str):
-                    node[index] = self._replace(item)
-                else:
-                    self._substitute_in_place(item)
+                node[index] = self.anonymize_value(item)
 
     def _discover(self, text: str) -> None:
         """Find entities by pattern, skipping any span a more specific category claimed.
