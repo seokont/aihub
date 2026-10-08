@@ -24,12 +24,15 @@ from moni_gateway import approvals_api
 from moni_gateway.approvals_api import (
     ACTION_RUN_RESUMED,
     ACTION_TOOL_EXECUTED_AFTER_APPROVAL,
+    DETAIL_LIMIT,
     REASON_CONTINUED_WITHOUT_EXECUTING,
     REASON_DENIED,
     REASON_NO_THREAD_ID,
     REASON_OK,
     REASON_RESUME_FAILED,
+    ResumeOutcome,
     _resume_after_decision,
+    safe_detail,
 )
 
 APPROVAL_ID = uuid.UUID("9f6f2efd-0000-4000-8000-000000000001")
@@ -294,3 +297,86 @@ async def test_the_page_note_falls_back_when_nothing_is_recorded() -> None:
 
     assert "resume_failed" in note
     assert "RuntimeError" in note
+
+
+# ---------------------------------------------------------------------------
+# `detail` reaches a browser page and a permanent audit row: bound it and strip
+# what must not travel with it
+# ---------------------------------------------------------------------------
+
+#: Text a failed resume really produces, and the part of it that must not be published.
+LEAKY_DETAILS = [
+    (
+        "could not connect to postgresql+asyncpg://moni:s3cret-pw@10.0.0.5:55432/moni",
+        ["s3cret-pw", "10.0.0.5", "55432", "postgresql+asyncpg"],
+    ),
+    (
+        "connection to corporate-llm.internal:8000 refused",
+        ["corporate-llm.internal", "8000"],
+    ),
+    (
+        'relation "checkpoints" does not exist; SELECT thread_id FROM checkpoints WHERE id = 1',
+        ["checkpoints", "SELECT"],
+    ),
+    ("checkpoint is gone for thread run-96bf5c2aAbCdEf0123456789", ["AbCdEf0123456789"]),
+]
+
+
+@pytest.mark.parametrize(("raw", "forbidden"), LEAKY_DETAILS)
+def test_a_detail_never_carries_hosts_sql_or_keys(raw: str, forbidden: list[str]) -> None:
+    """The subtraction is the point: the diagnosis stays readable, the infrastructure does not go with it."""
+    cleaned = safe_detail(raw)
+
+    for secret in forbidden:
+        assert secret not in cleaned, f"{secret!r} survived sanitizing: {cleaned!r}"
+
+
+def test_a_detail_is_bounded() -> None:
+    """It is rendered in a page and stored in a row, so it has a ceiling."""
+    cleaned = safe_detail("x" * 5000)
+
+    assert len(cleaned) <= DETAIL_LIMIT
+
+
+def test_an_ordinary_sentence_survives() -> None:
+    """A rule that hides the diagnostic is worse than the leak it prevents -- the lesson from the
+    provider-body masking, applied here."""
+    cleaned = safe_detail("the approval row carries no thread_id, so there was nothing to continue")
+
+    assert "no thread_id" in cleaned
+    assert "redacted" not in cleaned
+
+
+def test_an_outcome_cannot_be_built_unsanitized() -> None:
+    """Enforced at construction, so every consumer is downstream of one place rather than each
+    remembering: the response, the audit row, and the page that renders that row verbatim."""
+    outcome = ResumeOutcome(
+        resumed=False,
+        reason=REASON_RESUME_FAILED,
+        detail="raising RuntimeError: could not reach postgresql+asyncpg://moni:hunter2@db:5432/moni",
+    )
+
+    assert "hunter2" not in outcome.detail
+    assert "db:5432" not in outcome.detail
+    assert "RuntimeError" in outcome.detail
+
+
+@pytest.mark.asyncio
+async def test_the_failure_detail_keeps_the_type_and_drops_the_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exception *type* identifies the fault; its message is where the DSN lives."""
+    audit = _Audit()
+    request, approval, _runner = _wire(
+        monkeypatch,
+        audit=audit,
+        raises=RuntimeError("could not connect to postgresql+asyncpg://moni:hunter2@db:5432/moni"),
+    )
+
+    outcome = await _resume_after_decision(request, approval)
+
+    assert "RuntimeError" in outcome.detail
+    assert "hunter2" not in outcome.detail
+    assert "hunter2" not in str(audit.row(ACTION_RUN_RESUMED)["result"]), (
+        "the audit row is rendered by the page, so it is a publication surface too"
+    )

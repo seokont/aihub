@@ -33,6 +33,7 @@ written per executed step — so the three rows of one decision join on those tw
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Annotated, Any, Final, Literal
 from uuid import UUID
@@ -77,6 +78,71 @@ REASON_RESUME_FAILED: Final = "resume_failed"
 REASON_DENIED: Final = "denied"
 
 
+#: How long a `detail` may be. It reaches a browser page and an audit row, so it is bounded for the same
+#: reason a provider body is: an unbounded string in a page is a rendering problem and an unbounded string
+#: in an audit row is a storage one.
+DETAIL_LIMIT: Final = 200
+
+#: A URL or DSN, **with any credentials in it**: `postgresql+asyncpg://user:pw@host:5432/db` is the
+#: shape a failed resume most often raises, and the password is the part that must never reach a page.
+_URL_RE: Final = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://\S+")
+
+#: A host, by name or by address, optionally with a port. Infrastructure detail, not a diagnosis.
+_HOST_RE: Final = re.compile(
+    r"\b(?:(?:[A-Za-z0-9\-]+\.)+[A-Za-z]{2,}|\d{1,3}(?:\.\d{1,3}){3})(?::\d+)?\b"
+)
+
+#: SQL, from the keyword to the end of the string: an exception that quotes a statement usually quotes it
+#: last, and the table and column names are the sensitive part.
+_SQL_RE: Final = re.compile(
+    r"\b(?:SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|ALTER\s+TABLE|DROP\s+TABLE)\b.*",
+    re.IGNORECASE,
+)
+
+#: Credential-shaped runs: same family as `moni_router.diagnostics`, kept local so this module does not
+#: depend on the router for a log-safety rule.
+_TOKEN_RE: Final = re.compile(r"[A-Za-z0-9_\-]{24,}")
+
+#: A double-quoted identifier. Postgres names the object *before* the statement that touched it —
+#: `relation "checkpoints" does not exist` — so masking from the SQL keyword alone leaves the table name
+#: standing, and the table name is the part worth removing.
+_QUOTED_NAME_RE: Final = re.compile(r'"[^"\n]{1,64}"')
+
+
+def safe_detail(text: str) -> str:
+    """A bounded, credential-free sentence for a human: hosts, SQL and key-shaped values removed.
+
+    **Why this exists.** The first version of the failure reason interpolated ``str(exc)``, because the
+    exception message is what makes a failure diagnosable — and the exception message is also where a DSN
+    with its password, a host, or a quoted statement lives. This string is not a log line: it goes into
+    the decision response and into an ``agent.run_resumed`` audit row that the approval **page** renders
+    verbatim, so it can reach a browser and a permanent table (§3.11).
+
+    The rule is therefore subtractive rather than trusting: a URL becomes ``<redacted-url>``, a host
+    ``<redacted-host>``, a statement ``<redacted-sql>``, a long mixed run ``<redacted-value>``. Prose
+    survives, because a sentence nobody can read is not a diagnostic either.
+
+    The exception's **type** is kept by the caller, which is the part that identifies the fault without
+    carrying any of its text; the full message stays in the server log, sanitized the same way.
+    """
+    collapsed = " ".join((text or "").split())
+    masked = _QUOTED_NAME_RE.sub("<redacted-name>", collapsed)
+    masked = _SQL_RE.sub("<redacted-sql>", masked)
+    masked = _URL_RE.sub("<redacted-url>", masked)
+    masked = _HOST_RE.sub("<redacted-host>", masked)
+
+    def _mask(match: re.Match[str]) -> str:
+        value = match.group(0)
+        # Same reasoning as the router's body masking: snake_case identifiers are what a diagnostic is
+        # made of, so a long run only counts as credential-shaped when it mixes digits with case.
+        has_digit = any(char.isdigit() for char in value)
+        mixed_case = any(char.islower() for char in value) and any(char.isupper() for char in value)
+        return "<redacted-value>" if (has_digit and mixed_case) or len(value) >= 32 else value
+
+    masked = _TOKEN_RE.sub(_mask, masked)
+    return masked[:DETAIL_LIMIT]
+
+
 @dataclass(frozen=True)
 class ResumeOutcome:
     """What the attempt to continue a run did, in terms a person can act on.
@@ -84,11 +150,18 @@ class ResumeOutcome:
     Replaces a bare ``bool``, which could not distinguish "there was nothing to continue", "the resume
     raised" and "it continued and executed nothing" — three different problems that all presented as
     ``run_resumed: false`` (or, worse, as ``true``) in the live finding this exists to explain.
+
+    ``detail`` is sanitized in ``__post_init__`` rather than at each construction site, so an
+    unsanitized outcome **cannot exist**: every consumer — the response body, the audit row, and the page
+    that renders that row verbatim — is downstream of this one place.
     """
 
     resumed: bool
     reason: str
     detail: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "detail", safe_detail(self.detail))
 
 
 #: 422 by number rather than by ``status.HTTP_422_UNPROCESSABLE_ENTITY``, which newer Starlette
@@ -193,12 +266,18 @@ async def _resume_after_decision(request: Request, approval: Approval) -> Resume
             "approval_resume_failed",
             approval_id=str(approval.id),
             error=type(exc).__name__,
-            detail=str(exc)[:300],
+            # Sanitized here too: a DSN with its password is the most likely thing a failed resume
+            # raises, and §3.11 does not distinguish between a log line and a page.
+            detail=safe_detail(str(exc)),
         )
         outcome = ResumeOutcome(
             resumed=False,
             reason=REASON_RESUME_FAILED,
-            detail=f"continuing the run raised {type(exc).__name__}: {str(exc)[:200]}",
+            # The exception's **type** only. Its message is what makes a failure diagnosable and is also
+            # where a DSN, a host or a quoted statement lives; the type identifies the fault without
+            # carrying any of that, and the sanitized message is in the server log for whoever is
+            # debugging. `ResumeOutcome` sanitizes whatever this is regardless, as defence in depth.
+            detail=f"continuing the run raised {type(exc).__name__}",
         )
         await _record_resume(request, approval, outcome)
         return outcome
