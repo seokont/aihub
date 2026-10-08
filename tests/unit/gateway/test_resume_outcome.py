@@ -25,6 +25,7 @@ from moni_gateway.approvals_api import (
     ACTION_RUN_RESUMED,
     ACTION_TOOL_EXECUTED_AFTER_APPROVAL,
     REASON_CONTINUED_WITHOUT_EXECUTING,
+    REASON_DENIED,
     REASON_NO_THREAD_ID,
     REASON_OK,
     REASON_RESUME_FAILED,
@@ -40,6 +41,13 @@ class _Audit:
 
     async def record(self, **kwargs: Any) -> None:
         self.rows.append(kwargs)
+
+    async def latest(self, *, trace_id: str, action: str) -> str | None:
+        """The Protocol's read, over the captured rows."""
+        for row in reversed(self.rows):
+            if row.get("trace_id") == trace_id and row.get("action") == action:
+                return cast(str | None, row.get("result"))
+        return None
 
     def actions(self) -> list[str]:
         return [str(row["action"]) for row in self.rows]
@@ -70,6 +78,7 @@ def _wire(
     state: Any = None,
     raises: Exception | None = None,
     thread_id: str | None = "run-96bf5c2a",
+    status: str = "approved",
 ) -> tuple[Any, Any, _Runner]:
     runner = _Runner(state=state, raises=raises)
 
@@ -86,7 +95,7 @@ def _wire(
         id=APPROVAL_ID,
         thread_id=thread_id,
         trace_id="run-96bf5c2a",
-        status="approved",
+        status=status,
         comment=None,
         user_sub="manager",
         tool="create_project_task",
@@ -225,3 +234,63 @@ async def test_the_step_keeps_the_approval_id_from_the_pending_entry(
         row = audit.row(ACTION_TOOL_EXECUTED_AFTER_APPROVAL)
         assert str(row["approval_id"]) == str(APPROVAL_ID)
         assert json.dumps(cast(dict[str, Any], row["args"])) != "{}", "the arguments are recorded"
+
+
+@pytest.mark.asyncio
+async def test_a_denial_is_not_reported_as_continued_without_executing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A denial resumes too — the graph records the refusal and finishes — and no step carries this
+    approval's id, because nothing was authorised. Reporting that as `continued_without_executing` would
+    raise the warning where the system did exactly what it was told, and a warning that fires on correct
+    behaviour stops being read."""
+    audit = _Audit()
+    request, approval, _runner = _wire(
+        monkeypatch, audit=audit, state={"steps_taken": []}, status="denied"
+    )
+
+    outcome = await _resume_after_decision(request, approval)
+
+    assert outcome.reason == REASON_DENIED
+    assert outcome.reason != REASON_CONTINUED_WITHOUT_EXECUTING
+    assert "denied" in outcome.detail
+    assert ACTION_TOOL_EXECUTED_AFTER_APPROVAL not in audit.actions()
+    assert REASON_DENIED in str(audit.row(ACTION_RUN_RESUMED)["result"])
+
+
+@pytest.mark.asyncio
+async def test_the_page_note_is_read_back_from_the_audit() -> None:
+    """The person who clicked sees the response body; somebody opening the link later sees only what was
+    stored. This is that read, and the stored row has to win."""
+    from moni_gateway.approval_page import _resume_note
+
+    audit = _Audit()
+    await audit.record(
+        user_id="manager",
+        action=ACTION_RUN_RESUMED,
+        result="resumed=False reason=no_thread_id detail=the approval row carries no thread_id",
+        trace_id="run-96bf5c2a",
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(audit_store=audit)))
+    approval = SimpleNamespace(trace_id="run-96bf5c2a", id=APPROVAL_ID)
+    outcome = SimpleNamespace(resumed=False, reason="no_thread_id", detail="from the response")
+
+    note = await _resume_note(cast(Any, request), cast(Any, approval), cast(Any, outcome))
+
+    assert note == "resumed=False reason=no_thread_id detail=the approval row carries no thread_id"
+    assert "from the response" not in note, "the response value was preferred over the stored row"
+
+
+@pytest.mark.asyncio
+async def test_the_page_note_falls_back_when_nothing_is_recorded() -> None:
+    """A page that refuses to render is worse than one showing the outcome it already has."""
+    from moni_gateway.approval_page import _resume_note
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(audit_store=_Audit())))
+    approval = SimpleNamespace(trace_id="run-96bf5c2a", id=APPROVAL_ID)
+    outcome = SimpleNamespace(resumed=False, reason="resume_failed", detail="RuntimeError: gone")
+
+    note = await _resume_note(cast(Any, request), cast(Any, approval), cast(Any, outcome))
+
+    assert "resume_failed" in note
+    assert "RuntimeError" in note

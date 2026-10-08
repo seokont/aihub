@@ -142,6 +142,11 @@ class _Audit:
     async def record(self, **kwargs: Any) -> None:
         self.rows.append(kwargs)
 
+    async def latest(self, *, trace_id: str, action: str) -> str | None:
+        """Not exercised by these tests; present so the double satisfies the Protocol."""
+        del trace_id, action
+        return None
+
 
 class _Runner:
     def __init__(self, state: dict[str, Any]) -> None:

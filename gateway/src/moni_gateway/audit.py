@@ -263,6 +263,18 @@ class AuditStore(Protocol):
         """Persist one audit entry."""
         ...
 
+    async def latest(self, *, trace_id: str, action: str) -> str | None:
+        """The ``result`` of the newest row for one trace and one action, or ``None``.
+
+        **One narrow read, deliberately not a query API.** Two keyword keys in, one string out: no
+        filters, no ordering to choose, no columns to select. It exists because the approval page has to
+        show *why* a decision did or did not continue a run to somebody who opens the link later — the
+        response body is seen only by whoever clicked, and the audit row is the only thing that outlives
+        them. A general reader over the audit table is how "who could see what" stops being answerable,
+        so the narrowness is the design rather than a first instalment.
+        """
+        ...
+
 
 class SqlAuditStore:
     """Default :class:`AuditStore`, backed by a SQLAlchemy async session factory."""
@@ -294,6 +306,21 @@ class SqlAuditStore:
         )
         async with self._session_factory() as session:
             return await insert_audit_entry(session, entry)
+
+    async def latest(self, *, trace_id: str, action: str) -> str | None:
+        """The newest matching row's ``result``; see the Protocol for why this is this narrow."""
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(audit_log.c.result)
+                    .where(audit_log.c.trace_id == trace_id, audit_log.c.action == action)
+                    .order_by(audit_log.c.ts.desc())
+                    .limit(1)
+                )
+            ).first()
+        if row is None or row[0] is None:
+            return None
+        return str(row[0])
 
 
 def audit_store(request: Request) -> AuditStore:

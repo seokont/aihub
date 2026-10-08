@@ -70,6 +70,11 @@ REASON_OK: Final = "ok"
 REASON_CONTINUED_WITHOUT_EXECUTING: Final = "continued_without_executing"
 REASON_NO_THREAD_ID: Final = "no_thread_id"
 REASON_RESUME_FAILED: Final = "resume_failed"
+#: The human said no. The graph still continues (it records the refusal and finishes), and no step
+#: carries this approval's id because nothing was authorised — so without this reason a denial would be
+#: reported as `continued_without_executing`: a warning raised where the system did exactly what it was
+#: told, which is how a warning stops being read.
+REASON_DENIED: Final = "denied"
 
 
 @dataclass(frozen=True)
@@ -208,6 +213,18 @@ async def _resume_after_decision(request: Request, approval: Approval) -> Resume
             resumed=True,
             reason=REASON_OK,
             detail=f"the run continued and {executed} executed step(s) named this approval",
+        )
+    elif approval.status == DENIED:
+        # A denial resumes too — the graph records the refusal and finishes — and no step carries this
+        # approval's id, because nothing was authorised. Before this reason existed a denial was reported
+        # as `continued_without_executing`, i.e. as a warning about a run that had done nothing wrong.
+        outcome = ResumeOutcome(
+            resumed=True,
+            reason=REASON_DENIED,
+            detail=(
+                "the human denied this tool, so nothing was executed: the refusal is recorded and the run "
+                "finished normally"
+            ),
         )
     else:
         # The case a bare `True` hid: the graph continued, so nothing looked wrong, and the approved

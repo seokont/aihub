@@ -231,6 +231,33 @@ def _pending_page(approval: Approval, token: str) -> HTMLResponse:
     )
 
 
+async def _resume_note(request: Request, approval: Approval, outcome: ResumeOutcome) -> str:
+    """What happened to the run, **read back from the audit** rather than taken from the response.
+
+    Whoever clicked sees the response body. Somebody opening the same link an hour later sees only what
+    was stored, so the page reads the row instead: that is what stops the two from disagreeing, and the
+    row is written for every decision — including the ones that could not continue the run.
+
+    Imported lazily, like `_resume_after_decision` below and for the same reason: `approvals_api` imports
+    this module, so a module-level import of the constant would be a cycle.
+
+    Falls back to the outcome in hand when the row cannot be read. A page that refuses to render is worse
+    than one showing a slightly less authoritative sentence, and the decision itself is already durable.
+    """
+    from moni_gateway.approvals_api import ACTION_RUN_RESUMED
+
+    store = getattr(request.app.state, "audit_store", None)
+    if store is not None and approval.trace_id:
+        try:
+            recorded = await store.latest(trace_id=approval.trace_id, action=ACTION_RUN_RESUMED)
+        except Exception as exc:  # noqa: BLE001 - the decision is already durable
+            log.warning("resume_note_unreadable", error=type(exc).__name__)
+        else:
+            if recorded:
+                return str(recorded)
+    return f"resumed={outcome.resumed} reason={outcome.reason} detail={outcome.detail}"
+
+
 def _decided_page(
     approval: Approval, *, headline: str, note: str, status_code: int = 200
 ) -> HTMLResponse:
@@ -397,11 +424,7 @@ async def decide_by_link(request: Request, approval_id: UUID) -> HTMLResponse:
         run_resumed=outcome.resumed,
     )
     if decided.status == APPROVED:
-        note = (
-            "Виконання поновлено з тієї ж точки зупинки."
-            if outcome.resumed
-            else "Рішення збережено, але поновити виконання не вдалося — перевірте журнал gateway."
-        )
+        note = await _resume_note(request, decided, outcome)
         return _decided_page(decided, headline="Дію підтверджено.", note=note)
     return _decided_page(
         decided,

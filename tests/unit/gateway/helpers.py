@@ -141,6 +141,13 @@ class RecordingAuditStore:
     records: list[RecordedAudit] = field(default_factory=list)
     fail: bool = False
 
+    async def latest(self, *, trace_id: str, action: str) -> str | None:
+        """The newest matching `result`, in memory: the Protocol's one read."""
+        for captured in reversed(self.records):
+            if captured.trace_id == trace_id and captured.action == action:
+                return captured.result
+        return None
+
     async def record(
         self,
         *,
