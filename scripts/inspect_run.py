@@ -156,15 +156,30 @@ def diagnose(
     return verdicts
 
 
+def state_from_tuple(checkpoint_tuple: Any) -> Mapping[str, Any]:
+    """The channel values out of a :class:`CheckpointTuple`.
+
+    **`aget_tuple` is not `aget_state`.** It returns a ``CheckpointTuple`` — ``config``, ``checkpoint``,
+    ``metadata``, ``pending_writes`` — and it has **no** ``values`` attribute; that belongs to the
+    ``StateSnapshot`` returned by ``aget_state``. The first version of this script read ``.values`` and
+    would have raised ``AttributeError`` the first time it was pointed at a real database: the pure
+    decision table was tested and the one line that reads the checkpointer was not, which is exactly the
+    gap these tests close. The state lives in ``checkpoint["channel_values"]``, decoded by the saver
+    before it is handed back.
+    """
+    checkpoint = getattr(checkpoint_tuple, "checkpoint", None) or {}
+    return dict(checkpoint.get("channel_values") or {})
+
+
 async def _read_state(database_url: str, thread_id: str) -> Mapping[str, Any] | None:
     """The checkpointed state via the checkpointer — the same view the graph resumes from."""
     from moni_agent.checkpoints import checkpointer_from_url
 
     async with checkpointer_from_url(database_url) as saver:
-        snapshot = await saver.aget_tuple({"configurable": {"thread_id": thread_id}})
-    if snapshot is None:
+        checkpoint_tuple = await saver.aget_tuple({"configurable": {"thread_id": thread_id}})
+    if checkpoint_tuple is None:
         return None
-    return dict(snapshot.values or {})
+    return state_from_tuple(checkpoint_tuple)
 
 
 async def _read_approval(database_url: str, approval_id: str) -> Mapping[str, Any] | None:
@@ -287,6 +302,21 @@ def _print_report(
         print(f"  - {verdict}")
 
 
+def use_selector_event_loop() -> None:
+    """Use a selector loop on Windows, because psycopg's async pool needs one.
+
+    Windows defaults to ``ProactorEventLoop``, where psycopg's async connection fails; the policy has to
+    be set **before** the loop is created, hence the call at the top of :func:`main` rather than inside
+    the coroutine. Reached through ``getattr`` so the module still imports on a platform whose `asyncio`
+    has no such policy (and so a type checker does not have to know which platform it is running on).
+    """
+    if sys.platform != "win32":
+        return
+    policy = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+    if policy is not None:
+        asyncio.set_event_loop_policy(policy())
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--thread-id", default=None, help="the run's thread id, e.g. run-96bf5c2a")
@@ -316,6 +346,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="defaults to $DATABASE_URL (postgresql+asyncpg://...), the same setting the gateway needs",
     )
     args = parser.parse_args(argv)
+
+    # Before any `asyncio.run`: the loop policy cannot be changed once a loop exists, and psycopg's async
+    # pool needs the selector loop on Windows.
+    use_selector_event_loop()
 
     database_url = (args.database_url or os.environ.get("DATABASE_URL") or "").strip()
     if not database_url:
