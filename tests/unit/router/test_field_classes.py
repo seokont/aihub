@@ -5,7 +5,13 @@ The measurement in the module docstring found 0 of 32 numeric fields unclassifie
 guarantee, because the next field a module adds has to be classified deliberately rather than arriving
 unprotected with a green suite around it.
 
-The fourth test is the honest half: the existing specific read tools are **not** covered by the guard yet,
+**A test that passes for the wrong reason is worse than no test**, and this file had one: the money-name
+cases were parametrised over names already in `MONEY_FIELDS`, so `classify` answered from the table and the
+pattern was never consulted — removing the pattern left the suite green. Cases that exist to exercise a
+fallback must assert that the fallback is the only thing that *can* answer, which the preconditions below
+do.
+
+The last test is the honest half: the existing specific read tools are **not** covered by the guard yet,
 their declarations carry no money/safe marking, and that gap is named here rather than implied by silence.
 """
 
@@ -50,6 +56,25 @@ STOCK_FIELDS = {
     "list_price": "float",
 }
 
+#: Money-shaped names in **neither** list, so only the pattern can classify them. The preconditions in the
+#: test assert that, because a name present in a list would make the case pass without the pattern being
+#: consulted — which is exactly how the first version of this file was vacuous.
+UNLISTED_MONEY_NAMES = (
+    "amount_total_untaxed",
+    "unit_cost_extra",
+    "gross_margin_pct",
+    "total_volume_price",
+    "salary_bonus",
+)
+
+#: Names that are on the money list, for the separate "the table answers" case.
+LISTED_MONEY_NAMES = ("price_unit", "amount_total", "balance", "debit", "amount_residual")
+
+
+# ---------------------------------------------------------------------------
+# Guard A: a declared numeric field must be classified
+# ---------------------------------------------------------------------------
+
 
 def test_every_numeric_field_in_a_realistic_declaration_is_classified() -> None:
     """The guard itself, on declarations of the shape the tool will publish."""
@@ -69,8 +94,22 @@ def test_an_unclassified_numeric_field_is_refused_by_name() -> None:
 
 
 def test_a_string_field_needs_no_classification() -> None:
-    """A date or a name is not a number, so the guard must not demand a decision about it."""
+    """A date or a name is not a number, so the guard must not demand a decision about it.
+
+    This is also what pins the guard as reading the **declared type**: a version that treated every field
+    as numeric would refuse a whitelist of names and dates.
+    """
     check_declared_fields("project.task", {"name": "str", "date_deadline": "str", "state": "str"})
+
+
+def test_a_numeric_field_on_the_safe_list_is_accepted() -> None:
+    """The other side of the same guard, so it is not merely refusing everything numeric."""
+    check_declared_fields("project.task", {"task_count": "int", "planned_hours": "float"})
+
+
+# ---------------------------------------------------------------------------
+# Guard B: a money-named field may never be safe
+# ---------------------------------------------------------------------------
 
 
 def test_no_field_that_reads_like_money_sits_on_the_safe_list() -> None:
@@ -82,24 +121,43 @@ def test_no_field_that_reads_like_money_sits_on_the_safe_list() -> None:
     assert unsafe_safe_fields() == []
 
 
-@pytest.mark.parametrize(
-    "name",
-    [
-        "price_unit",
-        "cost",
-        "margin",
-        "amount_total",
-        "total_amount",
-        "balance",
-        "salary",
-        "wage",
-        "debit",
-        "credit",
-        "amount_residual",
-    ],
-)
-def test_a_money_name_is_classified_as_money_even_when_unlisted(name: str) -> None:
-    """The direction that matters: mistaking money for safe exports a value."""
+def test_the_safe_list_detector_actually_detects() -> None:
+    """Pinned directly, because ``assert unsafe_safe_fields() == []`` also passes for a function that
+    always returns ``[]`` — the current list being clean is not the same as the check working."""
+    assert unsafe_safe_fields({"margin_total", "qty_available", "salary_bonus"}) == [
+        "margin_total",
+        "salary_bonus",
+    ]
+    assert unsafe_safe_fields({"qty_available", "count"}) == []
+
+
+# ---------------------------------------------------------------------------
+# `classify`: the table first, then the money-name pattern, then plain
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", LISTED_MONEY_NAMES)
+def test_a_listed_money_field_is_money(name: str) -> None:
+    assert name in MONEY_FIELDS, "this case exists to test the table, so the name must be on it"
+    assert classify(name) == "money"
+
+
+@pytest.mark.parametrize("name", UNLISTED_MONEY_NAMES)
+def test_a_money_name_is_money_even_when_unlisted(name: str) -> None:
+    """The direction that matters: mistaking money for safe exports a value.
+
+    The preconditions are the fix for the vacuous version: every name here must be on **neither** list, so
+    the pattern is the only thing that can answer. Without them, removing the pattern leaves the suite
+    green — which is what happened.
+    """
+    assert name not in MONEY_FIELDS, (
+        f"{name!r} is on the money list, so the table answers, not the pattern"
+    )
+    assert name not in SAFE_FIELDS, f"{name!r} is on the safe list, which contradicts this case"
+    assert MONEY_NAME_RE.search(name), (
+        f"{name!r} does not match the pattern, so this case is misnamed"
+    )
+
     assert classify(name) == "money"
 
 
@@ -107,6 +165,7 @@ def test_a_money_name_is_classified_as_money_even_when_unlisted(name: str) -> No
     "name", ["qty_available", "count", "id", "task_count", "offset", "duration"]
 )
 def test_a_safe_name_is_safe(name: str) -> None:
+    assert name in SAFE_FIELDS
     assert classify(name) == "safe"
 
 
@@ -115,20 +174,23 @@ def test_the_two_lists_do_not_overlap() -> None:
     assert not (MONEY_FIELDS & SAFE_FIELDS)
 
 
-def test_a_plain_string_name_is_plain() -> None:
-    assert classify("state") == "plain"
-    assert classify("client_ref") == "plain", (
-        "a derived reference is neither money nor safe — it is the documented residual limit, and calling "
-        "it safe would be a claim this module cannot support"
-    )
+@pytest.mark.parametrize("name", ["state", "client_ref", "name", "date_order"])
+def test_a_plain_name_is_plain(name: str) -> None:
+    assert classify(name) == "plain"
 
 
-def test_the_money_name_pattern_covers_russian_language_field_names_too() -> None:
+def test_a_derived_reference_is_plain_and_named_as_the_limit() -> None:
+    """``client_ref`` is the documented residual limit. Calling it safe would be a claim this cannot
+    support: it matches no pattern, and the seeding pass does not know the field."""
+    assert classify("client_ref") == "plain"
+
+
+def test_the_money_name_pattern_does_not_reach_non_latin_names() -> None:
     """The stack is Ukrainian/Russian-facing, and a custom Odoo field may be named in either language.
 
-    Latin-only matching would classify such a field ``plain``; the honest statement is that the list is
-    name-based, so a non-Latin money field has to be added explicitly. This test pins the *limit* rather
-    than pretending the pattern reaches it.
+    Latin-only matching classifies such a field ``plain``; the honest statement is that the list is
+    name-based, so a non-Latin money field has to be added explicitly. This pins the *limit* rather than
+    pretending the pattern reaches it.
     """
     assert MONEY_NAME_RE.search("suma") is None, (
         "if a non-Latin money pattern is added, update this test and the module docstring"
