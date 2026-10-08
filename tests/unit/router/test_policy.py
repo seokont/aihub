@@ -26,7 +26,7 @@ import pytest
 from langchain_core.messages import HumanMessage
 
 from moni_router.anonymizer import Anonymizer
-from moni_router.chat import chat
+from moni_router.chat import _local_chat, chat
 from moni_router.classifier import LEVEL_ORDER, ContextPart
 from moni_router.policy import (
     DESTINATIONS,
@@ -421,6 +421,47 @@ async def test_a_level_b_stream_restores_entities_across_frame_boundaries() -> N
     assert PII not in body_text(cloud_seen[0])
 
     await cloud.aclose()
+
+
+# ---------------------------------------------------------------------------
+# The external destination: recorded as the fact it is, never as "local"
+# ---------------------------------------------------------------------------
+
+
+async def test_the_local_call_reports_an_external_destination_as_external() -> None:
+    """**Mutation this catches: keep recording ``destination="local"`` on the primary path.**
+
+    The primary path's transport is the same one a private deployment uses, so the only thing that
+    can distinguish "on this machine" from "somebody's endpoint" is what the call *reports*. Until
+    this existed, the value was the literal ``"local"``, and the trace and the audit row therefore
+    asserted a §3.4 property that had stopped being true — which is the failure this whole change
+    is about, stated where it is cheapest to keep true.
+
+    ``_local_chat`` is driven directly rather than through ``chat``: the level-A refusal is policy's
+    job and is asserted against ``route_request``, and this test is about the *transport layer's*
+    report. Reaching it through ``chat`` would need the permission, which would leave the default
+    path — the one an unpermitted run takes — untested.
+    """
+    local, local_seen = json_client(ENV["VLLM_BASE_URL"], completion("локально"))
+
+    result = await _local_chat(
+        messages=[HumanMessage(content=B_QUESTION)],
+        tools=(),
+        temperature=0.0,
+        max_tokens=16,
+        client=local,
+        env=ENV,
+        # What `chat` hands it from the route, and the only thing that tells this transport it is
+        # addressing somebody else's endpoint.
+        destination="external",
+    )
+
+    assert len(local_seen) == 1
+    # Written by `_local_chat`, and the fact `chat` copies onto the result the agent traces.
+    assert result.destination == "external"
+    assert result.anonymized is False, "the flag is decided by the route, not by this function"
+
+    await local.aclose()
 
 
 # ---------------------------------------------------------------------------

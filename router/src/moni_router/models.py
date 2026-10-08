@@ -36,7 +36,14 @@ PHASE1_LEVEL: Final[DataLevel] = "A"
 
 #: Where a model call actually went. Reported per call, so "did this leave the server?" is
 #: answerable for a step rather than for a run (§3.4, §3.8).
-Destination = Literal["local", "cloud"]
+#:
+#: Three values, and ``external`` is the one that keeps the other two honest. `local` used to mean
+#: "not the cloud", which was true only while the primary model was assumed to be on this machine:
+#: with ``VLLM_BASE_URL`` pointed at a hosted endpoint, level A went out under a ``local`` label and
+#: the trace and the audit row asserted a §3.4 property that had become false. A destination is a
+#: fact about the host, so it is recorded as that fact — ``external`` is "the primary model path,
+#: which is not this machine", regardless of which configuration made it so.
+Destination = Literal["local", "cloud", "external"]
 
 
 #: The JSON Schema type vocabulary a tool parameter may declare. Anything else is rejected when the

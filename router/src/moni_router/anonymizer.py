@@ -28,8 +28,11 @@ the text: a reference derived from a client name (``client_ref: "ROMASHKA-2026"`
 because an ERP is full of fields we cannot name from here. The audit therefore records
 ``anonymised=true`` as a statement that **this mechanism ran**, never that the payload carries no
 identifying data, and the limit is written down here rather than implied by the name. Anything leaving
-the host is anonymised by mechanism; that is a different claim from the payload being clean, and the two
-must not be conflated in a warning, a reason string or a report.
+the host is anonymised by mechanism — ``policy.requires_anonymisation`` is what decides *when*, and it
+answers by destination rather than by level, so this module also runs on the primary path when that
+path is not on this machine. That is a different claim from the payload being clean, and the two must
+not be conflated in a warning, a reason string or a report: the shared wording lives in
+``policy.ANONYMISATION_COVERAGE``.
 """
 
 from __future__ import annotations

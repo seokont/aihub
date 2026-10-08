@@ -29,6 +29,7 @@ from moni_gateway.chat_api import conversation_key as _conversation_key
 from moni_gateway.config import Settings
 from moni_gateway.ratelimit import NullRateLimiter, RateLimitDecision, RateLimiter
 from moni_gateway.rbac import ROLE_TOOLS
+from moni_router.policy import LEVEL_A_REFUSAL_UK, LevelARefusedError
 
 from .helpers import RecordingAuditStore, Signer, StubOIDC
 
@@ -525,6 +526,39 @@ async def test_a_rejected_token_is_audited_as_denied(
 
     assert response.status_code == 401
     assert ACTION_AUTH_ME_DENIED in audit_store.actions or ACTION_RUN in audit_store.actions
+
+
+async def test_a_level_a_refusal_reaches_the_user_as_the_ukrainian_message(
+    settings: Settings, signer: Signer, audit_store: RecordingAuditStore
+) -> None:
+    """**Mutation this catches: let the refusal fall through as a generic run failure.**
+
+    §3.4's refusal is the one run failure whose reader can fix it: the person at the screen is the
+    person who sets the flag. ``agent run failed (LevelARefusedError)`` names a type nobody outside
+    this codebase recognises, so rule 4 — the refusal reaches the user as Ukrainian text naming the
+    reason — is only true if the message travels in the response. The audit row is asserted too: a
+    refused run is still a run, and §3.8 wants the attempt rather than only the successes.
+    """
+    app = make_app(
+        settings,
+        signer,
+        audit_store,
+        agent=ScriptedAgent(
+            error=LevelARefusedError("level A on an external primary without the permission")
+        ),
+    )
+
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://g") as client:
+            response = await client.post("/v1/chat/completions", headers=auth(signer), json=body())
+
+    assert response.status_code == 500, "a refusal is not an upstream gateway failure"
+    detail = response.json()["detail"]
+    assert detail == LEVEL_A_REFUSAL_UK
+    assert "MONI_ALLOW_LEVEL_A_EXTERNAL" in detail
+    assert "LevelARefusedError" not in detail, "the user gets the reason, not the exception's name"
+    assert audit_store.only(ACTION_RUN).result == "error: LevelARefusedError"
 
 
 # ---------------------------------------------------------------------------

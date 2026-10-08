@@ -581,3 +581,61 @@ async def test_each_node_gets_its_own_generation_budget() -> None:
 def test_every_node_has_a_budget() -> None:
     """A node missing from the table falls back to the default that truncated it."""
     assert set(NODE_MAX_TOKENS) == {"plan", "act", "verify", "respond"}
+
+
+# ---------------------------------------------------------------------------
+# The run carries where the primary model is (§3.4, task 2a)
+# ---------------------------------------------------------------------------
+
+
+async def test_the_run_hands_the_external_primary_to_every_model_call() -> None:
+    """**Mutation this catches: build `RunRouting` without the fact the runner was given.**
+
+    The runner is constructed once per run and makes **two** `RunRouting` objects — one in
+    ``__init__`` and a fresh one per run in ``_begin_run`` — and it is the second that the model
+    calls actually see. A fact passed to only one of them is a fact that is missing at exactly the
+    calls that matter: ``plan``, ``act``, ``verify`` and ``respond`` all route through the runner's
+    own routing, so the level-A refusal, the anonymisation flag and the recorded destination would
+    all revert to their private-primary values without anything failing loudly.
+    """
+    model = FakeModel(script_rounds(1, verify="DONE", respond="Готово."))
+    toolbox = FakeToolBox(payloads={"get_my_tasks": {"tasks": []}})
+    agent = AgentRunner(
+        policy=AllowAllPolicy(),
+        toolbox=toolbox,
+        model=model,
+        primary_is_external=True,
+        allow_level_a_external=True,
+    )
+
+    await run(agent)
+
+    # Read off the runner after a real run, which is the object every node used. The fake model
+    # returns a plain `ChatResult`, so this is the handle on what the graph handed the router.
+    assert agent.routing.primary_is_external is True
+    assert agent.routing.allow_level_a_external is True
+    assert model.calls, "a run that made no model call would make this prove nothing"
+
+
+async def test_the_permitted_flag_is_per_run_and_not_only_at_construction() -> None:
+    """`_begin_run` replaces the router state, so the fact has to be re-applied there too.
+
+    `arun` calls `_begin_run` before the graph runs, which discards the construction-time
+    `RunRouting`. Asserting the *second* one is what distinguishes a runner that threads the fact
+    through from one that happened to be constructed with it.
+    """
+    model = FakeModel(script_rounds(1, verify="DONE", respond="Готово."))
+    toolbox = FakeToolBox(payloads={"get_my_tasks": {"tasks": []}})
+    agent = AgentRunner(
+        policy=AllowAllPolicy(),
+        toolbox=toolbox,
+        model=model,
+        primary_is_external=True,
+    )
+
+    before = agent.routing
+    await run(agent)
+
+    assert agent.routing is not before, "the run must have replaced the per-run routing state"
+    assert agent.routing.primary_is_external is True
+    assert agent.routing.allow_level_a_external is False, "no permission was given to this run"

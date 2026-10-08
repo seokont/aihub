@@ -77,11 +77,21 @@ class FakeRedis:
 
 
 class FakeSettings:
-    """The two attributes `build_worker_context` reads off the gateway's Settings."""
+    """The attributes `build_worker_context` reads off the gateway's Settings.
+
+    The three routing ones were added with task 2a: the worker's startup guard is now told what it
+    is checking (`primary_base_url`, `environment`, `allow_level_a_external`) instead of reading the
+    environment a second time, so this double has to carry them. `primary_base_url = None` is the
+    "not configured yet" state, which the guard treats as private rather than as an egress.
+    """
 
     database_url = "postgresql+asyncpg://moni:x@127.0.0.1:5432/moni"
     db_pool_size = 5
     approval_link_key = "link-key-for-tests"
+    primary_base_url: str | None = None
+    primary_is_external = False
+    allow_level_a_external = False
+    environment = "dev"
 
 
 def _config(**overrides: Any) -> WorkerConfig:
@@ -269,3 +279,61 @@ def test_a_placeholder_mailbox_counts_as_unconfigured() -> None:
     assert not WorkerConfig.from_env(
         {"MONI_REDIS_URL": "redis://redis:6379/0", **partial}
     ).polling_enabled
+
+
+# ---------------------------------------------------------------------------
+# The primary model's location, refused at worker startup (task 2a, §3.4)
+# ---------------------------------------------------------------------------
+
+
+def test_the_worker_refuses_to_start_when_the_primary_is_external_outside_dev() -> None:
+    """**Mutation this catches: drop the startup check from `build_worker_context`.**
+
+    A triggered run reads inbound mail bodies, which are level A, and nobody is watching a background
+    run — so an external primary is worse here than in the gateway, not better. The refusal has to
+    happen **before** the engine is built, and `LevelARefusedError` must not be reachable at all: the
+    worker either routes level-A data off this machine knowingly or does not start.
+    """
+    from moni_router.chat import PrimaryModelNotPrivateError
+
+    class ServerSettings(FakeSettings):
+        primary_base_url = "https://api.openai.com/v1"
+        environment = "server"
+
+    with pytest.raises(PrimaryModelNotPrivateError):
+        build_worker_context(_config(), redis=FakeRedis(), settings=ServerSettings())
+
+
+def test_the_worker_refuses_the_level_a_permission_outside_dev() -> None:
+    """The flag's whole justification is test data on a laptop, and a worker is not one.
+
+    §3.12 applied to a permission: a server stand that inherited `MONI_ALLOW_LEVEL_A_EXTERNAL=true`
+    from a copied `.env` would send mail bodies to a third party with nobody having decided to.
+    """
+    from moni_router.chat import PrimaryModelNotPrivateError
+
+    class PermittedServerSettings(FakeSettings):
+        primary_base_url = "https://api.openai.com/v1"
+        allow_level_a_external = True
+        environment = "production"
+
+    with pytest.raises(PrimaryModelNotPrivateError) as excinfo:
+        build_worker_context(_config(), redis=FakeRedis(), settings=PermittedServerSettings())
+
+    assert "MONI_ALLOW_LEVEL_A_EXTERNAL" in str(excinfo.value)
+
+
+def test_the_worker_starts_on_a_private_primary() -> None:
+    """Anti-vacuity: the checks above must not be a worker that never starts.
+
+    A private primary, with the permission unset, is the deployed configuration — and it is the one
+    the two refusals have to leave alone.
+    """
+
+    class PrivateSettings(FakeSettings):
+        primary_base_url = "http://corporate-llm:8000/v1"
+        environment = "production"
+
+    context = build_worker_context(_config(), redis=FakeRedis(), settings=PrivateSettings())
+
+    assert context[SETTINGS_KEY] is not None

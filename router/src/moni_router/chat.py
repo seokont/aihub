@@ -49,8 +49,19 @@ from moni_router.diagnostics import (
     safe_body,
     status_and_reason,
 )
-from moni_router.models import ChatResult, StreamChunk, ToolSpec
-from moni_router.policy import Route, RunRouting, cloud_chat, cloud_stream, route
+from moni_router.models import ChatResult, Destination, StreamChunk, ToolSpec
+from moni_router.policy import (
+    LEVEL_A_REFUSAL_UK,
+    Route,
+    RunRouting,
+    _flag,
+    _primary_reason,
+    cloud_chat,
+    cloud_stream,
+    requires_anonymisation,
+    route,
+)
+from moni_router.provider import CloudUnavailable
 from moni_router.wire import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_TIMEOUT_SECONDS,
@@ -116,13 +127,30 @@ def primary_host_concern(base_url: str) -> str | None:
     return f"{host!r} is a public address"
 
 
-def assert_primary_is_private(base_url: str | None = None, *, moni_env: str | None = None) -> None:
-    """Refuse a non-private primary model outside dev; warn loudly inside it (§3.4, §3.12).
+def assert_primary_is_private(
+    base_url: str | None = None,
+    *,
+    moni_env: str | None = None,
+    allow_level_a_external: bool | None = None,
+) -> None:
+    """Refuse an external primary model outside dev; warn loudly inside it (§3.4, §3.12).
 
     The same shape as the placeholder-credential refusal in the gateway: a state the process cannot
     honour is one it must not serve on. ``MONI_ENV=dev`` is the documented escape, because a laptop
     running the agent against a hosted model on test data is a legitimate thing to want — it just must
     not be *quiet*, and it must not be inherited by a server stand.
+
+    **The second escape is level-A-specific and dev-only.** With ``MONI_ALLOW_LEVEL_A_EXTERNAL=true``
+    the operator has accepted that level-A data leaves the host on this stand; in dev that is a
+    warning naming the permission, and anywhere else it is a refusal. That asymmetry is deliberate: a
+    warning can be overridden by a flag, and a permission to send finance and PII to somebody else's
+    endpoint is exactly the setting that must not be inheritable by a server stand.
+
+    **What changed with the external destination.** The old warning said level-B payloads would not be
+    anonymised, which was true while anonymisation ran on the cloud path only; it now runs wherever the
+    destination leaves the host, so that sentence is gone and the remaining consequence — level A goes
+    to that host — is stated with the mechanism's limit rather than as a bare alarm. The warning, the
+    route reasons and the audit row say the same thing, from the same string.
     """
     source_url = base_url if base_url is not None else (os.environ.get("VLLM_BASE_URL") or "")
     environment = (moni_env if moni_env is not None else (os.environ.get("MONI_ENV") or "")).strip()
@@ -133,24 +161,70 @@ def assert_primary_is_private(base_url: str | None = None, *, moni_env: str | No
     if concern is None:
         return
 
-    consequences = (
-        "level-A data (finance, salaries, client PII, email and WhatsApp bodies) will be sent to that "
-        "host, because the classifier treats the primary path as the on-server destination; "
-        "level-B payloads will NOT be anonymised, because anonymisation runs on the cloud path only; "
-        "and the trace will still record destination=local"
+    permitted = (
+        _flag(os.environ.get(LOCAL_ENV.allow_level_a_external))
+        if allow_level_a_external is None
+        else allow_level_a_external
     )
+
+    # The consequence, phrased by the same helper the routes use, so an operator reading the log and a
+    # reader of a reason string are looking at one statement of the same fact.
+    consequence = _primary_reason(
+        RunRouting(primary_is_external=True, allow_level_a_external=permitted),
+        degraded=False,
+        detail=(
+            "level-A data (finance, salaries, client PII, email and WhatsApp bodies) goes to that "
+            "host unless the level-A route refuses it"
+        ),
+    )
+    if permitted and environment.lower() == "dev":
+        log.warning(
+            "primary_model_not_private",
+            base_url=source_url,
+            concern=concern,
+            moni_env=environment,
+            permission=LOCAL_ENV.allow_level_a_external,
+            detail=(
+                f"MONI_ALLOW_LEVEL_A_EXTERNAL is set and MONI_ENV=dev, so level A is accepted as "
+                f"leaving this host: {consequence}. Refusal text for an unpermitted run: "
+                f"{LEVEL_A_REFUSAL_UK}"
+            ),
+        )
+        return
+
+    if permitted:
+        # §3.12 fail closed: the flag's whole justification is "test data on a laptop", and a server
+        # stand inheriting it would send level-A data to a third party with nobody having decided to.
+        msg = (
+            f"refusing to start: VLLM_BASE_URL is {source_url} ({concern}) and "
+            f"{LOCAL_ENV.allow_level_a_external} is set, which is dev-only because it permits "
+            f"level-A data (finance, salaries, client PII, email and WhatsApp bodies) to leave this "
+            f"host. Set MONI_ENV=dev for a local stand with test data, unset "
+            f"{LOCAL_ENV.allow_level_a_external}, or point the primary model at a private address."
+        )
+        log.error(
+            "primary_model_not_private_refused",
+            base_url=source_url,
+            concern=concern,
+            permission=LOCAL_ENV.allow_level_a_external,
+        )
+        raise PrimaryModelNotPrivateError(msg)
+
     if environment.lower() == "dev":
         log.warning(
             "primary_model_not_private",
             base_url=source_url,
             concern=concern,
             moni_env=environment,
-            detail=f"allowed because MONI_ENV=dev, but note that {consequences}",
+            detail=(
+                f"allowed because MONI_ENV=dev; {consequence}. A level-A request is refused rather "
+                f"than sent — the user reads: {LEVEL_A_REFUSAL_UK}"
+            ),
         )
         return
 
     msg = (
-        f"refusing to start: VLLM_BASE_URL is {source_url} ({concern}), so {consequences}. "
+        f"refusing to start: VLLM_BASE_URL is {source_url} ({concern}), so {consequence}. "
         "Set MONI_ENV=dev for a local stand with test data, or point the primary model at a private "
         "address."
     )
@@ -174,6 +248,14 @@ class _LocalEnvNames:
     tool_only_body: str = "VLLM_EXTRA_BODY_WITH_TOOLS_JSON"
     #: Which token-cap field name to emit: `max_tokens` or `max_completion_tokens`.
     max_tokens_field: str = "VLLM_MAX_TOKENS_FIELD"
+    #: The explicit statement that the **primary** model path is not on this machine. It exists for
+    #: the one case the URL cannot express — a private-looking address that tunnels to a hosted
+    #: service — and it is not the only way to be external: a public URL is recognised without it.
+    primary_is_external: str = "VLLM_PRIMARY_IS_EXTERNAL"
+    #: The operator's acceptance that level-A data leaves the host on this stand. Dev-only: outside
+    #: `MONI_ENV=dev` the startup guard refuses, because the flag's whole justification is test data
+    #: on a laptop, and a server stand inheriting it is a decision nobody made.
+    allow_level_a_external: str = "MONI_ALLOW_LEVEL_A_EXTERNAL"
 
 
 #: The operator-facing names, so no call site retypes a string.
@@ -374,17 +456,34 @@ def classify(
     )
 
 
-def _degraded_local(decision: Route) -> Route:
-    """The same route, degraded to the local destination after a cloud failure."""
+def _primary_destination(routing: RunRouting | None) -> Destination:
+    """Where the **primary** path is, as a value a ``ChatResult`` may carry.
+
+    One helper rather than the literal ``"local"`` at each site, because that literal is what made the
+    trace and the audit row assert a §3.4 property that had stopped being true: the primary path is
+    ``local`` only while the primary model is on this machine.
+    """
+    return "external" if routing is not None and routing.primary_is_external else "local"
+
+
+def _degraded_local(decision: Route, routing: RunRouting | None = None) -> Route:
+    """The same route, degraded to the primary destination after a cloud failure.
+
+    The destination and the anonymisation flag are both recomputed here rather than reset to
+    ``"local"``/``False``, which is what they used to be: a degraded level-B call on an external
+    primary went out in the clear under a ``local`` label, and this is the second of the three
+    constructions that had to change (the other two are in ``policy.route``).
+    """
+    destination = _primary_destination(routing)
     return replace(
         decision,
-        destination="local",
-        requires_anonymisation=False,
+        destination=destination,
+        requires_anonymisation=requires_anonymisation(decision.level, destination),
         cloud_model=None,
         degraded=True,
         escalated=False,
         reason=(
-            f"cloud unavailable for level {decision.level}; degraded to the local model for this "
+            f"cloud unavailable for level {decision.level}; degraded to the primary model for this "
             "call and for the rest of the run (§3.12)"
         ),
     )
@@ -466,7 +565,7 @@ async def chat(
                 detail=str(exc)[:200],
             )
             routing.record_cloud(failed=True)
-            decision = _degraded_local(decision)
+            decision = _degraded_local(decision, routing)
         else:
             routing.record_cloud(failed=False)
             return result
@@ -478,10 +577,20 @@ async def chat(
         max_tokens=max_tokens,
         client=client,
         env=env,
+        # The route's answer, not a re-derivation: `_degraded_local` recomputes the destination for
+        # the degraded case, and a second opinion here is how the two would drift apart.
+        destination=decision.destination,
+        # Handed to the transport rather than applied here, because *the transport is what sends*:
+        # on an external primary this is the only place the payload can be anonymised before it is
+        # serialised into the request body, and `cloud_chat` already does the same thing for its own
+        # destination for the same reason.
+        anonymize=decision.requires_anonymisation,
+        anonymizer=anonymizer,
     )
-    result.destination = "local"
     result.level = decision.level
-    result.anonymized = False
+    # An external primary anonymises, so the flag is the route's answer rather than a constant. On a
+    # private primary nothing changed: that path never anonymised and still does not.
+    result.anonymized = decision.requires_anonymisation
     result.degraded = decision.degraded
     if routing is not None:
         routing.record_local(failed=result.is_empty)
@@ -496,8 +605,36 @@ async def _local_chat(
     max_tokens: int,
     client: httpx.AsyncClient | None,
     env: dict[str, str] | None,
+    destination: Destination = "local",
+    anonymize: bool = False,
+    anonymizer: Anonymizer | None = None,
 ) -> ChatResult:
-    """One call to the local model, with the bounded 5xx retry."""
+    """One call to the primary model, with the bounded 5xx retry.
+
+    ``destination`` is what the *route* decided — ``local`` or ``external`` — and it is recorded on
+    the result because that record is what the trace and the audit row carry. The primary path is one
+    transport with two possible locations, so the transport cannot infer the fact: it is told.
+
+    ``anonymize`` is the route's other answer, and it is applied **here** rather than at the call site
+    because this is the function that builds the body: anonymising after the payload has been
+    serialised is not anonymising. The refusal that keeps a level-A payload from reaching this point
+    without the permission lives in ``policy.route_request`` — one guard, in the place the decision is
+    made, rather than a second one that could disagree with it.
+
+    A payload this call is told to anonymise and has no anonymiser for is **refused** rather than sent
+    in the clear, which is the same fail-closed reading ``cloud_chat`` already takes for level B: the
+    alternative is the leak the flag exists to prevent.
+    """
+    if anonymize:
+        if anonymizer is None:
+            msg = (
+                f"this call is routed to an external primary ({destination}) and requires "
+                "anonymisation, but no anonymiser was supplied; refusing to send the payload rather "
+                "than sending it in the clear"
+            )
+            raise CloudUnavailable(msg)
+        messages = anonymizer.anonymize_messages(to_wire_messages(messages))
+
     base_url, api_key, model = resolve_settings(env)
     body = build_payload(
         messages,
@@ -572,7 +709,11 @@ async def _local_chat(
         msg = "model returned a non-JSON response"
         raise RouterError(msg) from exc
 
-    return parse_completion(payload, fallback_model=model)
+    result = parse_completion(payload, fallback_model=model)
+    # `parse_completion` has no opinion about routing, and its default is the fail-closed `local`; the
+    # route is what actually knows, so it is written here.
+    result.destination = destination
+    return result
 
 
 async def stream_chat(
@@ -627,7 +768,7 @@ async def stream_chat(
                 detail=str(exc)[:200],
             )
             routing.record_cloud(failed=True)
-            decision = _degraded_local(decision)
+            decision = _degraded_local(decision, routing)
         else:
             routing.record_cloud(failed=False)
             return
@@ -639,6 +780,10 @@ async def stream_chat(
         max_tokens=max_tokens,
         client=client,
         env=env,
+        # Same two facts as the non-streaming path, for the same reason: the payload is anonymised
+        # where it is built, and a stream is a transport like any other.
+        anonymize=decision.requires_anonymisation,
+        anonymizer=anonymizer,
     ):
         yield chunk
 
@@ -651,8 +796,25 @@ async def _local_stream(
     max_tokens: int,
     client: httpx.AsyncClient | None,
     env: dict[str, str] | None,
+    anonymize: bool = False,
+    anonymizer: Anonymizer | None = None,
 ) -> AsyncIterator[StreamChunk]:
-    """The local streaming call, with the bounded retry up to the first status line."""
+    """The local streaming call, with the bounded retry up to the first status line.
+
+    ``anonymize`` behaves exactly as it does in :func:`_local_chat` — the payload is substituted
+    before the body is built, and a call that needs an anonymiser and has none is refused rather than
+    streamed in the clear. A stream is not a weaker destination than a single completion.
+    """
+    if anonymize:
+        if anonymizer is None:
+            msg = (
+                "this streaming call is routed to an external primary and requires anonymisation, "
+                "but no anonymiser was supplied; refusing to send the payload rather than sending "
+                "it in the clear"
+            )
+            raise CloudUnavailable(msg)
+        messages = anonymizer.anonymize_messages(to_wire_messages(messages))
+
     base_url, api_key, model = resolve_settings(env)
     body = build_payload(
         messages,

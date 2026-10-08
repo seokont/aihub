@@ -28,13 +28,16 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import anyio
 import pytest
 
 from moni_gateway.agent_runtime import default_agent_factory
 from moni_gateway.config import Settings
+
+if TYPE_CHECKING:
+    from moni_agent.graph import AgentRunner
 
 
 class _ScopeHoldingToolbox:
@@ -137,3 +140,57 @@ async def _enter(context: Any) -> Any:
 
 async def _exit(context: Any) -> None:
     await context.__aexit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# The primary model's location reaches the runner (task 2a, §3.4)
+# ---------------------------------------------------------------------------
+
+
+async def test_the_production_factory_resolves_the_primary_and_hands_it_to_the_runner(
+    settings: Settings,
+) -> None:
+    """**Mutation this catches: build the runner without the resolved routing facts.**
+
+    The gateway's composition root is where the environment is read once. Everything downstream —
+    the level-A refusal, the anonymisation flag, the recorded destination — depends on the fact
+    arriving in the runner, and the failure without it is silent: a level-A call is simply sent to a
+    hosted endpoint under a `local` label, and no test that looks only at the router would notice,
+    because the router was never told.
+
+    The URL is what makes the primary external here, so no flag is involved: this asserts rule 1's
+    first half (a public URL is external on its own) survives the trip through the factory, and that
+    the permission travels beside it.
+    """
+    external = settings.model_copy(
+        update={
+            "primary_base_url": "https://api.openai.com/v1",
+            "allow_level_a_external": True,
+        }
+    )
+    toolbox = _ScopeHoldingToolbox()
+
+    async with default_agent_factory(
+        settings=external,
+        allowed_tools=[],
+        toolbox_factory=lambda _settings: toolbox,
+        checkpointer_factory=_no_checkpointer,
+    ) as resolved:
+        # `AgentRunnerLike` is deliberately narrow — the gateway's types never import the agent — so
+        # the concrete runner is named here rather than widening the protocol for a test's benefit.
+        runner = cast("AgentRunner", resolved)
+        assert runner.routing.primary_is_external is True
+        assert runner.routing.allow_level_a_external is True
+
+    # Anti-vacuity: the same construction with the settings the fixture builds (no URL, no
+    # permission) must *not* claim an external primary, or the assertion above would be satisfied by
+    # a runner that always says yes.
+    async with default_agent_factory(
+        settings=settings.model_copy(update={"primary_base_url": "http://corporate-llm:8000/v1"}),
+        allowed_tools=[],
+        toolbox_factory=lambda _settings: _ScopeHoldingToolbox(),
+        checkpointer_factory=_no_checkpointer,
+    ) as resolved_private:
+        private = cast("AgentRunner", resolved_private)
+        assert private.routing.primary_is_external is False
+        assert private.routing.allow_level_a_external is False

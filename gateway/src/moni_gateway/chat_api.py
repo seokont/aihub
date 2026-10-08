@@ -66,6 +66,7 @@ from moni_gateway.ratelimit import Limiter, limiter_from_settings
 from moni_gateway.rbac import allowed_tools, describe_access
 from moni_gateway.run_task import RunTask
 from moni_gateway.security import Claims, OIDCClient, TokenInvalidError, verify_token
+from moni_router.policy import LEVEL_A_REFUSAL_UK, LevelARefusedError
 
 log = structlog.get_logger(__name__)
 
@@ -601,6 +602,7 @@ async def _run_once(
         result = "error"
         failure = f"{type(exc).__name__}"
         log.error("agent_run_failed", trace_id=trace_id, error=failure, detail=str(exc)[:300])
+        _refuse_level_a_to_the_caller(exc, trace_id=trace_id)
     finally:
         if store is not None:
             # Shielded: this `finally` also runs while a cancellation is in flight, and the row
@@ -631,6 +633,38 @@ async def _run_once(
         trace_id=trace_id,
         approval=approval,
     )
+
+
+def _refuse_level_a_to_the_caller(exc: BaseException, *, trace_id: str) -> None:
+    """Turn the router's level-A refusal into the Ukrainian answer the user reads (§3.4, §4).
+
+    **Why this is not just another 502.** Every other failure of a run is an infrastructure fact —
+    the model was unreachable, a tool failed — and ``agent run failed (ModelUnavailable)`` is the
+    honest, if terse, answer to it. This one is different in kind: the run did exactly what it was
+    configured to do, and the person who can change the configuration is reading the screen. A bare
+    error name tells them nothing they can act on, so the router's message — which names the reason,
+    the flag and the dev-only limit — travels as the HTTP detail.
+
+    ``500`` rather than ``502``: nothing upstream misbehaved. Returning normally (HTTP 200 with an
+    apology) is not an option either — a refusal that looks like an answer is how a user comes to
+    believe a question was processed.
+
+    Raises **inside** the caller's ``except`` block on purpose, so the audit row written by the
+    ``finally`` below still records the refused run: §3.8 wants the attempt, not only the successes.
+    """
+    if not isinstance(exc, LevelARefusedError):
+        return
+    # `detail` carries the English fact for an operator reading logs; the message is the user's.
+    log.warning(
+        "level_a_refused_to_caller",
+        trace_id=trace_id,
+        reason_type=type(exc).__name__,
+        detail=exc.detail,
+    )
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=LEVEL_A_REFUSAL_UK,
+    ) from exc
 
 
 def _approval_card_text(card: Mapping[str, Any]) -> str:
@@ -948,6 +982,7 @@ async def _stream_run(
         result = "error"
         failure = type(exc).__name__
         log.error("agent_run_failed", trace_id=trace_id, error=failure, detail=str(exc)[:300])
+        _refuse_level_a_to_the_caller(exc, trace_id=trace_id)
     finally:
         if store is not None:
             await _audit_run_shielded(

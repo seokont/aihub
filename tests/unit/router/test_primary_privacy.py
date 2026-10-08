@@ -22,6 +22,7 @@ from moni_router.chat import (
     assert_primary_is_private,
     primary_host_concern,
 )
+from moni_router.policy import ANONYMISATION_COVERAGE
 
 PRIVATE_URLS = [
     "http://127.0.0.1:8001/v1",
@@ -63,10 +64,15 @@ def test_a_public_primary_host_refuses_to_start_outside_dev(url: str) -> None:
         assert_primary_is_private(url, moni_env="server")
 
     message = str(excinfo.value)
-    # The refusal has to name *what* leaks, or an operator reads it as pedantry about URLs.
+    # The refusal has to name *what* leaks, or an operator reads it as pedantry about URLs. Three
+    # claims, and the third is the one the external-primary change made true rather than assumed:
+    # level A goes to that host, the mechanism's documented limit travels with the claim instead of a
+    # bare alarm, and the label the router used to write for this configuration is gone.
     assert "level-A" in message
-    assert "NOT be anonymised" in message
-    assert "destination=local" in message
+    assert ANONYMISATION_COVERAGE in message
+    assert "destination=local" not in message, (
+        "the old text asserted a label the router no longer writes for this configuration"
+    )
 
 
 @pytest.mark.parametrize("environment", ["dev", " DEV ", "Dev"])

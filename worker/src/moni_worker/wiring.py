@@ -152,11 +152,20 @@ def build_worker_context(
     from moni_worker.dedup import MessageLedger
     from moni_worker.gate import RedisUserGate
 
-    assert_primary_is_private()
+    # The one Settings object is resolved *before* the guard, and the guard is told what it is
+    # checking rather than left to read the environment again: the two readers would otherwise be
+    # two answers about the same process, and the gateway's lifespan already passes its settings
+    # explicitly for the same reason.
+    resolved = settings if settings is not None else get_settings()
+
+    assert_primary_is_private(
+        resolved.primary_base_url,
+        moni_env=resolved.environment,
+        allow_level_a_external=resolved.allow_level_a_external,
+    )
 
     validate_trigger_identity(config)
 
-    resolved = settings if settings is not None else get_settings()
     engine = create_engine(resolved)
     sessions = session_factory_for(engine)
     # `session_factory_for` returns an `async_sessionmaker`, but is annotated with the looser

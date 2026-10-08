@@ -362,6 +362,13 @@ services:
       # on a request with no tools, and plan/verify/respond carry none.
       VLLM_EXTRA_BODY_WITH_TOOLS_JSON: ${VLLM_EXTRA_BODY_WITH_TOOLS_JSON:-}
       VLLM_MAX_TOKENS_FIELD: ${VLLM_MAX_TOKENS_FIELD:-}
+      # Is the primary model actually on this machine (task 2a, §3.4)? A public URL is external
+      # without help; the flag covers a private-looking address that tunnels outward. Level A is
+      # refused by the router unless the permission below is set, and the permission is refused by
+      # the startup check outside MONI_ENV=dev. Both are read here rather than derived: the URL
+      # above is the container-facing address, so the fact has to travel as a fact.
+      VLLM_PRIMARY_IS_EXTERNAL: ${VLLM_PRIMARY_IS_EXTERNAL:-}
+      MONI_ALLOW_LEVEL_A_EXTERNAL: ${MONI_ALLOW_LEVEL_A_EXTERNAL:-}
       # Tracing (§3.8). Optional: with no public key the agent's tracer is a no-op.
       LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse:3000}
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
@@ -701,6 +708,12 @@ services:
       # on a request with no tools, and plan/verify/respond carry none.
       VLLM_EXTRA_BODY_WITH_TOOLS_JSON: ${VLLM_EXTRA_BODY_WITH_TOOLS_JSON:-}
       VLLM_MAX_TOKENS_FIELD: ${VLLM_MAX_TOKENS_FIELD:-}
+      # Is the primary model actually on this machine (task 2a, §3.4)? The worker reads mail
+      # bodies, which are level A, and nobody is watching a background run — so the same two
+      # facts the gateway takes, and the same refusal at startup when the permission is set
+      # outside MONI_ENV=dev.
+      VLLM_PRIMARY_IS_EXTERNAL: ${VLLM_PRIMARY_IS_EXTERNAL:-}
+      MONI_ALLOW_LEVEL_A_EXTERNAL: ${MONI_ALLOW_LEVEL_A_EXTERNAL:-}
       LANGFUSE_HOST: ${LANGFUSE_HOST:-http://langfuse:3000}
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
       LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}

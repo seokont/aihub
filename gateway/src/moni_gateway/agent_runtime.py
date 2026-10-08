@@ -140,6 +140,7 @@ async def default_agent_factory(
     from moni_agent.mcp_tools import McpToolBox
     from moni_agent.toolboxes import MultiToolBox
     from moni_router.chat import chat
+    from moni_router.policy import run_routing_for
     from moni_router.provider import CloudConfig
 
     database_url = settings.database_url
@@ -162,6 +163,14 @@ async def default_agent_factory(
         if cloud is not None
         else None
     )
+
+    # Where the **primary** model path is, resolved once for the run (task 2a). One reader of the
+    # environment — `run_routing_for` applies the same host check `assert_primary_is_private` does,
+    # so a startup that warned or refused and a run that routes cannot disagree about a host. The
+    # fact travels into the runner rather than being re-read per call: `plan`, `act`, `verify` and
+    # `respond` route through the runner's own `RunRouting`, so a per-call read would be a second
+    # answer to the same question.
+    routing = run_routing_for(settings)
 
     async with (checkpointer_factory or checkpointer_from_url)(database_url) as saver:
         # The seam, applied. With no factory supplied this is *literally* the construction this
@@ -202,6 +211,12 @@ async def default_agent_factory(
                 # now classified per call from the context it carries, with §3.12's fail-closed
                 # default (A) applying to anything the classifier cannot place.
                 cloud=cloud_config,
+                # Where the primary path is, and whether level-A data may be sent there (task 2a).
+                # Both are the run's facts, so the runner threads them into every `RunRouting` it
+                # builds; without the first, a level-A call would be sent to a hosted endpoint under
+                # a `local` label, and without the second it would be sent at all.
+                primary_is_external=routing.primary_is_external,
+                allow_level_a_external=routing.allow_level_a_external,
             )
             log.info(
                 "agent_ready",
@@ -209,6 +224,11 @@ async def default_agent_factory(
                 granted_tools=len(allowed_tools),
                 limits=limits.describe(),
                 cloud_configured=cloud_config is not None,
+                # Not the URL (§3.11 keeps addresses out of the log where they are not needed), and
+                # not the permission: what an operator needs is whether level-A calls will be
+                # refused, and that is the pair of booleans.
+                primary_is_external=routing.primary_is_external,
+                allow_level_a_external=routing.allow_level_a_external,
             )
             yield runner
         finally:

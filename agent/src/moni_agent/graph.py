@@ -281,6 +281,8 @@ class AgentRunner:
         policy: PolicyClient | None = None,
         approvals: ApprovalClient | None = None,
         cloud: CloudConfig | None = None,
+        primary_is_external: bool = False,
+        allow_level_a_external: bool = False,
     ) -> None:
         self._toolbox = toolbox
         self._model = model
@@ -302,17 +304,47 @@ class AgentRunner:
         # The cloud settings, as values (see moni_router.provider.CloudConfig). Built by the
         # composition root from Settings; the router decides whether it may be used.
         self._cloud = cloud
+        # Where the **primary** model path is, and whether this run may send level-A data to it when
+        # it is not on this machine (§3.4). Both are facts the composition root resolved once, from
+        # the environment and the URL check; neither is re-derived here. They are defaults of
+        # `False`, which is the fail-closed pair for them: "the primary is on this server" is only
+        # ever true of a configuration that says so, and no permission is granted by accident.
+        #
+        # They are threaded to *both* `RunRouting` constructions below — the one here and the fresh
+        # one per run — because it is the per-run object the nodes actually route through, so a
+        # fact applied only at construction would be missing at every `plan`, `act`, `verify` and
+        # `respond`.
+        self._primary_is_external = primary_is_external
+        self._allow_level_a_external = allow_level_a_external
         # Per run, replaced in `_begin_run`. A fresh escalation counter and a fresh placeholder
         # map per run is a requirement, not tidiness: an anonymiser shared between runs would leak
         # one user's entities into another's placeholders, and an escalation counter that survived
         # a run would let a second run escalate without failing anything first.
-        self._routing = RunRouting(cloud=cloud)
+        self._routing = RunRouting(
+            cloud=cloud,
+            primary_is_external=primary_is_external,
+            allow_level_a_external=allow_level_a_external,
+        )
         self._anonymizer = Anonymizer()
         self._graph = self._build()
 
+    @property
+    def routing(self) -> RunRouting:
+        """This run's routing state, as the nodes see it.
+
+        Exposed for the tests that assert the run carries where the primary model is: the object is
+        replaced at the start of every run, so "was the fact passed in?" is only answerable by
+        reading the one the run actually used.
+        """
+        return self._routing
+
     def _begin_run(self) -> None:
         """Reset the per-run routing state and the per-run placeholder map."""
-        self._routing = RunRouting(cloud=self._cloud)
+        self._routing = RunRouting(
+            cloud=self._cloud,
+            primary_is_external=self._primary_is_external,
+            allow_level_a_external=self._allow_level_a_external,
+        )
         self._anonymizer = Anonymizer()
 
     # -- wiring -------------------------------------------------------------

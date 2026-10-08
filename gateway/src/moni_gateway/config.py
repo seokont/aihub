@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import re
 from functools import lru_cache
+from typing import Annotated
 from urllib.parse import urlsplit
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import BeforeValidator, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from moni_gateway.approval_links import MIN_KEY_LENGTH as MIN_LINK_KEY_LENGTH
@@ -28,6 +29,25 @@ _PLACEHOLDER_PATTERN = re.compile(r"change[-_]?me", re.IGNORECASE)
 
 def _is_placeholder(value: str) -> bool:
     return bool(_PLACEHOLDER_PATTERN.search(value))
+
+
+def _empty_boolean_is_false(value: object) -> object:
+    """Read a boolean environment value, treating ``""`` as ``False`` (and not as an error).
+
+    **Why this exists.** `.env.example` documents a boolean knob the only way a template can — as a
+    commented explanation followed by ``FLAG=`` — and ``docker compose`` passes that through as an
+    empty string. ``pydantic`` parses ``true``/``1``/``yes``/``on`` and
+    ``false``/``0``/``no``/``off``, but an empty value is a validation **error**, so the template's
+    own default would refuse to start the service it documents. "Present but blank" is the same
+    statement as "absent" for a flag, and reading it as ``False`` is the fail-closed direction for
+    both flags this is attached to: no permission, and no claim that the primary is external.
+
+    Anything else is left alone, so a misspelling still raises rather than silently reading as
+    ``False`` — the one thing worse than a refused start is a flag that looks set and is not.
+    """
+    if isinstance(value, str) and not value.strip():
+        return False
+    return value
 
 
 class Settings(BaseSettings):
@@ -151,6 +171,40 @@ class Settings(BaseSettings):
     # Minimum length is enforced in `approval_links.mint_link` as well as here, so a short key
     # cannot be smuggled in by a caller that builds Settings some other way.
     approval_link_key: str | None = Field(default=None, alias="MONI_APPROVAL_LINK_KEY")
+
+    # -- The primary model path, and what it actually is (§3.4, task 2a) -------
+    # Declared here for the same reason CLOUD_* is: `scripts/check_environment.py` enforces that
+    # every setting the stack reads is documented in `.env.example`, and a router reading its own
+    # environment escapes that audit. The router still *reads* these through `os.environ` in
+    # `resolve_settings` — that is where the local client is built — but the two facts that decide
+    # whether level-A data may leave are resolved from here, once, by the composition root.
+    #
+    # **Absent is the on-server reading.** A URL that is not private (or the flag below) is what
+    # makes the primary external, and `run_routing_for` decides that from these values plus the
+    # same host check the startup guard uses, so the guard and the router cannot disagree about a
+    # host.
+    primary_base_url: str | None = Field(default=None, alias="VLLM_BASE_URL")
+
+    # An explicit statement that the primary path leaves this machine, for the case the URL cannot
+    # express: a private-looking address that tunnels to a hosted service. It is **not** the only
+    # way to be external — a public URL is recognised without it — and it is not a permission:
+    # level A is still refused unless the flag below is set.
+    #
+    # Both of this pair are documented in `.env.example` as `NAME=`, which reaches the container as
+    # an empty string — hence the annotated validators (`model_config` does not turn that into
+    # `False`; pydantic treats a blank as a parse *error*).
+    primary_is_external: Annotated[bool, BeforeValidator(_empty_boolean_is_false)] = Field(
+        default=False, alias="VLLM_PRIMARY_IS_EXTERNAL"
+    )
+
+    # The operator's acceptance that level-A data (finance, salaries, client PII, email and
+    # WhatsApp bodies) leaves this host on this stand. **Dev-only**: with it set outside
+    # ``MONI_ENV=dev`` the gateway and the worker refuse to start, because the flag's whole
+    # justification is test data on a laptop and a server stand inheriting it is a decision nobody
+    # made. With it, level-A calls proceed anonymised and are recorded as `destination=external`.
+    allow_level_a_external: Annotated[bool, BeforeValidator(_empty_boolean_is_false)] = Field(
+        default=False, alias="MONI_ALLOW_LEVEL_A_EXTERNAL"
+    )
 
     # -- Cloud LLM for level B/C (§3.4, task 2.4) ------------------------------
     # The endpoint level B (anonymised) and level C may reach. Declared here, exactly like
