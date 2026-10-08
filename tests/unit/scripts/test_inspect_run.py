@@ -185,3 +185,42 @@ def test_the_script_can_only_read() -> None:
     write_sql = ("INSERT INTO", "UPDATE ", "DELETE FROM", "DROP ", "ALTER ")
     offending = [text[:60] for text in statements if any(k in text for k in write_sql)]
     assert offending == [], f"the tool contains write SQL: {offending}"
+
+
+# ---------------------------------------------------------------------------
+# Cause (c) in its concrete form: the approval row itself has no thread_id
+# ---------------------------------------------------------------------------
+
+
+def test_an_approval_without_a_thread_id_is_named_before_anything_else() -> None:
+    """`_resume_after_decision` returns False **without calling the runner** when the approval row has no
+    thread_id, so the run's own state looks untouched and this is indistinguishable from a missing
+    checkpoint. Checked first for that reason."""
+    verdicts = diagnose(
+        None,
+        APPROVED_ONLY,
+        approval_row={"id": "9f6f2efd", "thread_id": None, "trace_id": "run-96bf5c2a"},
+    )
+
+    assert any("RESUME SKIPPED" in verdict for verdict in verdicts), verdicts
+    assert any("thread_id" in verdict for verdict in verdicts), verdicts
+    assert not any("NO CHECKPOINT" in verdict for verdict in verdicts), (
+        "a missing thread_id was reported as a missing checkpoint, which is the confusion to avoid"
+    )
+
+
+def test_an_approval_with_a_thread_id_does_not_trigger_that_rule() -> None:
+    verdicts = diagnose(
+        _state([_step(ok=True, result={"id": 7})]),
+        [*APPROVED_ONLY, "tool_executed_after_approval"],
+        approval_row={"id": "9f6f2efd", "thread_id": "run-96bf5c2a"},
+    )
+
+    assert not any("RESUME SKIPPED" in verdict for verdict in verdicts), verdicts
+
+
+def test_a_blank_thread_id_counts_as_absent() -> None:
+    """ "   " is what a partially-populated row looks like, and it must not be treated as a thread."""
+    verdicts = diagnose(None, APPROVED_ONLY, approval_row={"thread_id": "   "})
+
+    assert any("RESUME SKIPPED" in verdict for verdict in verdicts), verdicts

@@ -63,6 +63,7 @@ def diagnose(
     actions: Sequence[str],
     *,
     want_tool: str | None = None,
+    approval_row: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """The verdict, from the checkpoint state and the audit actions for the run.
 
@@ -71,6 +72,21 @@ def diagnose(
     database. ``want_tool`` is the tool the approval was for, when the approval row knows it.
     """
     verdicts: list[str] = []
+
+    # Checked first, because it makes every later question moot and it is the one cause that cannot be
+    # guessed from the run's own state: `_resume_after_decision` reads `approval.thread_id`, and when it
+    # is empty it logs `approval_resume_skipped` and returns False **without calling the runner at all**.
+    # A missing checkpoint and a missing thread_id then look identical from the outside.
+    if approval_row is not None and not str(approval_row.get("thread_id") or "").strip():
+        verdicts.append(
+            "RESUME SKIPPED -- THE APPROVAL ROW HAS NO thread_id. `_resume_after_decision` returns False "
+            "without calling the runner, so nothing was ever resumed and no tool could run. The thread_id "
+            "is written when the approval is created; a row without one means the pause did not record "
+            "where to continue. This is mechanism (c) in its most concrete form, and it is worth fixing "
+            "before reading anything else here."
+        )
+        return verdicts
+
     decided = "approval.decided" in actions
     executed_row = "tool_executed_after_approval" in actions
     failed_row = "tool_execution_failed_after_approval" in actions
@@ -151,6 +167,65 @@ async def _read_state(database_url: str, thread_id: str) -> Mapping[str, Any] | 
     return dict(snapshot.values or {})
 
 
+async def _read_approval(database_url: str, approval_id: str) -> Mapping[str, Any] | None:
+    """The approval row, so the operator does not have to guess the thread_id.
+
+    Matched on a **prefix** of the id: approvals are quoted in conversation and in the audit by their
+    first eight characters, and an exact-match lookup on a short id silently finds nothing -- which would
+    send the reader straight back to "no checkpoint", the confusion this tool exists to remove.
+    """
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(database_url, future=True)
+    try:
+        async with engine.connect() as connection:
+            row = (
+                (
+                    await connection.execute(
+                        text(
+                            "select id::text as id, thread_id, trace_id, tool, status, action_class, "
+                            "args_redacted from approvals where id::text like :prefix "
+                            "order by created_at desc limit 1"
+                        ),
+                        {"prefix": f"{approval_id}%"},
+                    )
+                )
+                .mappings()
+                .first()
+            )
+    finally:
+        await engine.dispose()
+    return dict(row) if row is not None else None
+
+
+async def _list_threads(database_url: str, limit: int) -> list[tuple[str, str, int]]:
+    """Recent thread ids that actually have checkpoints, newest first.
+
+    Read from `checkpoints` rather than from the approvals table, because the question this answers is
+    "which threads could be resumed at all" -- and a trace_id that matches no thread id is otherwise
+    indistinguishable from a run that was never checkpointed.
+    """
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(database_url, future=True)
+    try:
+        async with engine.connect() as connection:
+            rows = (
+                await connection.execute(
+                    text(
+                        "select thread_id, max(checkpoint_id) as latest, count(*) as points "
+                        "from checkpoints group by thread_id order by latest desc limit :limit"
+                    ),
+                    {"limit": limit},
+                )
+            ).all()
+    finally:
+        await engine.dispose()
+    return [(str(thread), str(latest), int(points)) for thread, latest, points in rows]
+
+
 async def _read_audit(database_url: str, trace_id: str) -> list[tuple[str, str, str]]:
     """The audit rows for the run, oldest first: (action, tool, safe args)."""
     from sqlalchemy import select
@@ -177,7 +252,11 @@ async def _read_audit(database_url: str, trace_id: str) -> list[tuple[str, str, 
 
 
 def _print_report(
-    thread_id: str, state: Mapping[str, Any] | None, audit: list[tuple[str, str, str]]
+    thread_id: str,
+    state: Mapping[str, Any] | None,
+    audit: list[tuple[str, str, str]],
+    *,
+    approval_row: Mapping[str, Any] | None = None,
 ) -> None:
     print(f"thread_id: {thread_id}")
     print(f"checkpoint: {'found' if state is not None else 'MISSING'}")
@@ -204,13 +283,28 @@ def _print_report(
         print(f"  absent: {', '.join(missing)}")
 
     print("verdict:")
-    for verdict in diagnose(state, [action for action, _, _ in audit]):
+    for verdict in diagnose(state, [action for action, _, _ in audit], approval_row=approval_row):
         print(f"  - {verdict}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--thread-id", required=True, help="the run's thread id, e.g. run-96bf5c2a")
+    parser.add_argument("--thread-id", default=None, help="the run's thread id, e.g. run-96bf5c2a")
+    parser.add_argument(
+        "--approval-id",
+        default=None,
+        help=(
+            "an approval id (a prefix is enough): its row gives the thread_id and trace_id, so a "
+            "trace/thread mismatch is not misread as a missing checkpoint"
+        ),
+    )
+    parser.add_argument(
+        "--list-threads",
+        type=int,
+        default=None,
+        metavar="N",
+        help="list the N most recently checkpointed thread ids and exit (read-only)",
+    )
     parser.add_argument(
         "--trace-id",
         default=None,
@@ -232,11 +326,48 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 2
 
+    if args.list_threads is not None:
+        threads = asyncio.run(_list_threads(database_url, int(args.list_threads)))
+        print(f"recent thread ids with checkpoints ({len(threads)}):")
+        for thread, latest, points in threads:
+            print(f"  {thread:<48} latest={latest} points={points}")
+        if not threads:
+            print("  (none: no run has been checkpointed in this database)")
+        return 0
+
+    approval_row: Mapping[str, Any] | None = None
+    if args.approval_id:
+        approval_row = asyncio.run(_read_approval(database_url, str(args.approval_id)))
+        if approval_row is None:
+            print(
+                f"no approval row matches {args.approval_id!r}; rerun with --list-threads to see what "
+                "the database does hold",
+                file=sys.stderr,
+            )
+            return 3
+        print(
+            f"approval {approval_row['id']}: tool={approval_row.get('tool')} "
+            f"status={approval_row.get('status')} action_class={approval_row.get('action_class')}"
+        )
+        print(
+            f"  thread_id={approval_row.get('thread_id')!r} trace_id={approval_row.get('trace_id')!r}"
+        )
+        if not (args.thread_id or "").strip():
+            args.thread_id = str(approval_row.get("thread_id") or "").strip() or None
+
+    if not (args.thread_id or "").strip():
+        print(
+            "no thread id to inspect: pass --thread-id, or --approval-id so it can be read from the "
+            "approval row, or --list-threads to see what exists",
+            file=sys.stderr,
+        )
+        return 2
+
     thread_id = str(args.thread_id)
-    trace_id = str(args.trace_id or thread_id)
+    trace_id = str(args.trace_id or (approval_row or {}).get("trace_id") or thread_id)
     state = asyncio.run(_read_state(database_url, thread_id))
     audit = asyncio.run(_read_audit(database_url, trace_id))
-    _print_report(thread_id, state, audit)
+    _print_report(thread_id, state, audit, approval_row=approval_row)
     return 0
 
 
