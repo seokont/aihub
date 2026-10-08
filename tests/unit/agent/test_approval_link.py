@@ -160,21 +160,16 @@ async def test_the_execution_row_is_written_from_the_state_a_resume_returns() ->
     assert row["args"], "the arguments are part of the row"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "SECOND FINDING, found by this control and not yet fixed: a DENIED decision still produces a "
-        "`tool_executed_after_approval` row. The refused step keeps the `approval_id` from the pending "
-        "entry, and the recorder writes a row for any step carrying it -- so a denial reads as 'it ran "
-        "and failed' when in fact nothing ran. `_record_executions`'s own docstring claims the opposite "
-        "('the refused step carries no approval_id'), which is why it was never questioned. Marker is "
-        "strict: when this starts passing, delete it."
-    ),
-)
 @pytest.mark.asyncio
 async def test_a_denial_writes_no_execution_row() -> None:
-    """The control: the recorder must not claim an execution for a call nobody authorised, or the
-    presence of the row stops meaning "it ran"."""
+    """A denial stays in `approval.decided`; it must not claim an execution.
+
+    This test found the second bug. It began as a control and failed: the refused step **does** carry
+    the `approval_id` (from the pending entry it replaces), so the recorder — which filtered on the id
+    alone — wrote `tool_executed_after_approval` for a denial, and the row read as "it ran and failed"
+    when nothing ran. The discriminator is `executed=False`, and `_record_executions` now requires
+    `executed is True`. It was `xfail(strict=True)` until that fix landed.
+    """
     runner = _runner(_script(), _argument_box(text="never"), approvals=RecordingApprovals())
     await _pause(runner, thread_id="thread-link-3")
     resumed = await runner.aresume(
@@ -187,3 +182,7 @@ async def test_a_denial_writes_no_execution_row() -> None:
     await _record_executions(cast(Any, _request(audit)), cast(Any, _approval()), resumed)
 
     assert ACTION_TOOL_EXECUTED_AFTER_APPROVAL not in audit.actions()
+    # The refusal is still recorded where it belongs, so this is not "the denial vanished".
+    denied = [step for step in (resumed.get("steps_taken") or []) if not step.get("executed")]
+    assert denied, "the denial left no step at all"
+    assert denied[-1].get("error", {}).get("code") == "approval_denied"

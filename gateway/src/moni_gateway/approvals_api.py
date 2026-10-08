@@ -368,15 +368,23 @@ async def _record_executions(request: Request, approval: Approval, state: Any) -
     name — is what makes the row attributable: a run that pauses twice, or calls the same tool twice
     under two decisions, would otherwise have its executions attributed to the wrong approval.
 
-    **A failed execution is still an execution.** The row is written with an ``error:`` result, because
-    "the human approved it and the tool refused" is exactly the sequence an auditor needs to see. The
-    alternative — recording only successes — would make a refused write indistinguishable from one that
-    never ran.
+    **Only steps that actually ran.** ``executed is True`` is required as well, because the id alone does
+    not mean the tool was called. A *denied* decision resumes too — the graph records the refusal and
+    finishes — and its step **does** carry the ``approval_id``, from the pending entry it replaces; what
+    distinguishes it is ``executed=False``. An earlier version of this function filtered on the id alone
+    and so wrote ``tool_executed_after_approval`` for a denial, which reads as "it ran and failed" when
+    nothing ran at all; the docstring here claimed the refused step carries no ``approval_id``, which was
+    never true and is why the row went unquestioned. A denial stays in ``approval.decided``, which is
+    where the refusal belongs.
 
-    **Why the failure path writes nothing.** A resume that raised did not execute anything, and the
-    signature of that is the state never being returned; there is no partial state to trust. A *denied*
-    decision resumes too (the graph records the refusal and finishes), but the refused step carries no
-    ``approval_id`` because nothing was authorised — so it is correctly absent here.
+    **A failed execution is still an execution.** A step that ran and failed has ``executed=True`` and is
+    recorded with an ``error:`` result, because "the human approved it and the tool refused" is exactly
+    the sequence an auditor needs to see. The alternative — recording only successes — would make a
+    refused write indistinguishable from one that never ran. That is the distinction ``executed`` draws:
+    *dispatched and failed* gets a row, *not dispatched* does not.
+
+    **Why a raised resume writes nothing.** A resume that raised did not execute anything, and the
+    signature of that is the state never being returned; there is no partial state to trust.
     """
     audit = getattr(request.app.state, "audit_store", None)
     if audit is None:
@@ -388,7 +396,7 @@ async def _record_executions(request: Request, approval: Approval, state: Any) -
     executed = [
         step
         for step in (state or {}).get("steps_taken") or []
-        if str(step.get("approval_id") or "") == wanted
+        if str(step.get("approval_id") or "") == wanted and step.get("executed") is True
     ]
     if not executed:
         # The normal shape for a denial: the decision stands and nothing ran. Logged rather than
