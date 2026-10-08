@@ -219,5 +219,5 @@ async def test_an_approval_with_no_checkpoint_is_not_resumed(
 
     resumed = await _resume_after_decision(_request(app), uncheckpointed)
 
-    assert resumed is False, "an approval with no thread id reported a successful resume"
+    assert resumed.resumed is False, "an approval with no thread id reported a successful resume"
     assert runner.calls == []

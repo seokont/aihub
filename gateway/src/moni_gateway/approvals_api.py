@@ -33,6 +33,7 @@ written per executed step — so the three rows of one decision join on those tw
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Annotated, Any, Final, Literal
 from uuid import UUID
 
@@ -57,6 +58,33 @@ log = structlog.get_logger(__name__)
 #: `moni_agent.graph` already document it — the name was agreed in four places and written in none, so
 #: this constant is the first place it is *used* rather than described.
 ACTION_TOOL_EXECUTED_AFTER_APPROVAL: Final = "tool_executed_after_approval"
+
+#: What a decision's attempt to continue its run did, and why. One row per attempt (§3.8): a run that
+#: did not continue is exactly what an operator needs to find, and a bare `run_resumed: false` in a
+#: response body is not findable. Read by the approval page as well, so somebody who returns later sees
+#: the same outcome as the person who clicked.
+ACTION_RUN_RESUMED: Final = "agent.run_resumed"
+
+#: Stable reason codes. Stable because they are read by the page, the audit and an operator's grep.
+REASON_OK: Final = "ok"
+REASON_CONTINUED_WITHOUT_EXECUTING: Final = "continued_without_executing"
+REASON_NO_THREAD_ID: Final = "no_thread_id"
+REASON_RESUME_FAILED: Final = "resume_failed"
+
+
+@dataclass(frozen=True)
+class ResumeOutcome:
+    """What the attempt to continue a run did, in terms a person can act on.
+
+    Replaces a bare ``bool``, which could not distinguish "there was nothing to continue", "the resume
+    raised" and "it continued and executed nothing" — three different problems that all presented as
+    ``run_resumed: false`` (or, worse, as ``true``) in the live finding this exists to explain.
+    """
+
+    resumed: bool
+    reason: str
+    detail: str
+
 
 #: 422 by number rather than by ``status.HTTP_422_UNPROCESSABLE_ENTITY``, which newer Starlette
 #: deprecates in favour of ``..._CONTENT``. The wire behaviour is what matters, and pinning the number
@@ -110,8 +138,8 @@ def approval_store(request: Request) -> SqlApprovalStore:
 ApprovalStoreDep = Annotated[SqlApprovalStore, Depends(approval_store)]
 
 
-async def _resume_after_decision(request: Request, approval: Approval) -> bool:
-    """Continue the paused run with the human's answer. Returns whether the run was resumed.
+async def _resume_after_decision(request: Request, approval: Approval) -> ResumeOutcome:
+    """Continue the paused run with the human's answer, and say what happened.
 
     Called **after** the decision has committed, and deliberately not fatal. The decision is final:
     a resume that fails must not un-make it, so the failure is logged and reported rather than
@@ -125,9 +153,19 @@ async def _resume_after_decision(request: Request, approval: Approval) -> bool:
     thread_id = (approval.thread_id or "").strip()
     if not thread_id:
         # No thread id means the run was not checkpointed (an approval created by hand, or by the
-        # seed hook), so there is nothing to continue.
+        # seed hook), so there is nothing to continue -- and the runner is never called at all. That is
+        # why this reason is checked before any reading of the run: the state looks untouched.
         log.info("approval_resume_skipped", approval_id=str(approval.id), reason="no thread_id")
-        return False
+        outcome = ResumeOutcome(
+            resumed=False,
+            reason=REASON_NO_THREAD_ID,
+            detail=(
+                "the approval row carries no thread_id, so there was nothing to continue: the call was "
+                "never resumed and no tool ran"
+            ),
+        )
+        await _record_resume(request, approval, outcome)
+        return outcome
 
     settings = request.app.state.settings
     policy, approvals = policy_clients_for(request.app)
@@ -152,18 +190,79 @@ async def _resume_after_decision(request: Request, approval: Approval) -> bool:
             error=type(exc).__name__,
             detail=str(exc)[:300],
         )
-        return False
+        outcome = ResumeOutcome(
+            resumed=False,
+            reason=REASON_RESUME_FAILED,
+            detail=f"continuing the run raised {type(exc).__name__}: {str(exc)[:200]}",
+        )
+        await _record_resume(request, approval, outcome)
+        return outcome
 
     # After the run and inside the same `try`-free path: a failure to *audit* must not be reported as a
     # failure to resume, because the run has already happened. `_record_executions` therefore swallows
     # and logs its own errors rather than raising into the caller.
-    await _record_executions(request, approval, state)
+    executed = await _record_executions(request, approval, state)
 
-    log.info("approval_resumed", approval_id=str(approval.id), thread_id=thread_id)
-    return True
+    if executed:
+        outcome = ResumeOutcome(
+            resumed=True,
+            reason=REASON_OK,
+            detail=f"the run continued and {executed} executed step(s) named this approval",
+        )
+    else:
+        # The case a bare `True` hid: the graph continued, so nothing looked wrong, and the approved
+        # call still did not run. `_observe` reads `steps_taken[-1]` and returns silently when the
+        # pending call is not there, so "continued but executed nothing" is a real and quiet outcome.
+        outcome = ResumeOutcome(
+            resumed=True,
+            reason=REASON_CONTINUED_WITHOUT_EXECUTING,
+            detail=(
+                "the run continued but no executed step named this approval, so the approved call did "
+                "not run: check the agent's `observe_noop` log for the reason"
+            ),
+        )
+    await _record_resume(request, approval, outcome)
+
+    log.info(
+        "approval_resumed",
+        approval_id=str(approval.id),
+        thread_id=thread_id,
+        reason=outcome.reason,
+        executed=executed,
+    )
+    return outcome
 
 
-async def _record_executions(request: Request, approval: Approval, state: Any) -> None:
+async def _record_resume(request: Request, approval: Approval, outcome: ResumeOutcome) -> None:
+    """One audit row per decision attempt, carrying the reason (§3.8).
+
+    Written here rather than in each route so a decision made through an emailed link records the same
+    row as one made through the API -- the link route is the one a person is most likely to use, and the
+    one where a later visitor has nothing else to read.
+
+    Failure to audit is logged and swallowed: the decision is already durable, and a bookkeeping error
+    must not turn into an error on a request whose real work already happened.
+    """
+    audit = getattr(request.app.state, "audit_store", None)
+    if audit is None:
+        return
+    try:
+        await audit.record(
+            user_id=approval.user_sub,
+            action=ACTION_RUN_RESUMED,
+            tool=None,
+            args={"approval_id": str(approval.id), "reason": outcome.reason},
+            result=f"resumed={outcome.resumed} reason={outcome.reason} detail={outcome.detail}",
+            trace_id=approval.trace_id,
+            approval_id=approval.id,
+        )
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        log.error(
+            "run_resumed_audit_failed", approval_id=str(approval.id), error=type(exc).__name__
+        )
+
+
+async def _record_executions(request: Request, approval: Approval, state: Any) -> int:
     """One audit row per step this decision actually executed (F6, §3.8).
 
     **Which steps count.** A step is attributed to an approval by the ``approval_id`` the agent carries
@@ -187,7 +286,7 @@ async def _record_executions(request: Request, approval: Approval, state: Any) -
     if audit is None:
         # A unit test that replaced the audit store, or an app without a lifespan. The decision is
         # already durable; the execution row is an addition, not a precondition.
-        return
+        return 0
 
     wanted = str(approval.id)
     executed = [
@@ -205,7 +304,7 @@ async def _record_executions(request: Request, approval: Approval, state: Any) -
             decision=approval.status,
             reason="no executed step named this approval",
         )
-        return
+        return 0
 
     for step in executed:
         ok = bool(step.get("ok"))
@@ -232,6 +331,7 @@ async def _record_executions(request: Request, approval: Approval, state: Any) -
                 tool=step.get("tool"),
                 error=type(exc).__name__,
             )
+    return len(executed)
 
 
 def _not_found() -> HTTPException:
@@ -307,8 +407,13 @@ async def decide_approval(
     # The decision is committed; continuing the run is the next thing that happens. A run that
     # cannot be continued is reported in the body rather than hidden, so a caller is never left
     # waiting for a continuation that will not arrive.
-    resumed = await _resume_after_decision(request, result.approval)
-    return {**result.approval.to_payload(), "run_resumed": resumed}
+    outcome = await _resume_after_decision(request, result.approval)
+    return {
+        **result.approval.to_payload(),
+        "run_resumed": outcome.resumed,
+        "run_resumed_reason": outcome.reason,
+        "run_resumed_detail": outcome.detail,
+    }
 
 
 __all__ = ["DecisionRequest", "approval_store", "approvals_router"]

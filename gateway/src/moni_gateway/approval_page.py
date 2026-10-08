@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import html
 import json
-from typing import Annotated, Final
+from typing import TYPE_CHECKING, Annotated, Final
 from urllib.parse import parse_qs
 from uuid import UUID
 
@@ -91,6 +91,10 @@ button.deny { background: #fff; color: #8c1d18; border-color: #d9a5a1; }
 p.outcome { font-weight: 600; margin: 0 0 .75rem; }
 p.note { color: #4a4f59; margin: .75rem 0 0; }
 """
+
+
+if TYPE_CHECKING:
+    from moni_gateway.approvals_api import ResumeOutcome
 
 
 class _Refused(Exception):
@@ -384,18 +388,18 @@ async def decide_by_link(request: Request, approval_id: UUID) -> HTMLResponse:
         )
 
     decided = result.approval
-    resumed = await _resume_after_decision(request, decided)
+    outcome = await _resume_after_decision(request, decided)
     log.info(
         "approval_decided_by_link",
         approval_id=str(decided.id),
         decision=decided.status,
         tool=decided.tool,
-        run_resumed=resumed,
+        run_resumed=outcome.resumed,
     )
     if decided.status == APPROVED:
         note = (
             "Виконання поновлено з тієї ж точки зупинки."
-            if resumed
+            if outcome.resumed
             else "Рішення збережено, але поновити виконання не вдалося — перевірте журнал gateway."
         )
         return _decided_page(decided, headline="Дію підтверджено.", note=note)
@@ -406,7 +410,7 @@ async def decide_by_link(request: Request, approval_id: UUID) -> HTMLResponse:
     )
 
 
-async def _resume_after_decision(request: Request, approval: Approval) -> bool:
+async def _resume_after_decision(request: Request, approval: Approval) -> ResumeOutcome:
     """The same continuation the JSON route uses, imported lazily to avoid a circular import.
 
     `approvals_api` imports this module's router, so the dependency runs one way at import time and

@@ -742,7 +742,15 @@ async def test_a_failed_resume_audits_no_execution(settings: Settings, signer: S
         )
 
     assert response.status_code == 200
-    assert audit.actions == []
+    # No *execution* is claimed: nothing ran, and a row saying otherwise would be a false positive in
+    # the one table that must not have one. What changed is that the failure to continue is now in the
+    # audit with its reason, instead of only in a server-side log the user cannot read.
+    assert "tool_executed_after_approval" not in audit.actions
+    assert "agent.run_resumed" in audit.actions
+    body = response.json()
+    assert body["run_resumed"] is False
+    assert body["run_resumed_reason"] == "resume_failed"
+    assert "RuntimeError" in body["run_resumed_detail"]
 
 
 async def test_an_audit_failure_does_not_fail_the_decision(

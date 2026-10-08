@@ -912,10 +912,39 @@ class AgentRunner:
         """
         steps = list(state.get("steps_taken") or [])
         if not steps:
+            # Typed rather than a bare `return {}`. This is the node an approved call has to pass
+            # through, and a silent no-op here is indistinguishable from a run that never resumed --
+            # which is what made the live finding expensive to explain.
+            log.warning("observe_noop", reason="no_steps", trace_id=state.get("trace_id"))
             return {}
         pending = steps[-1]
         # Only a dispatched call that has not already concluded is pending.
         if not pending.get("executed") or "ok" in pending:
+            # The dangerous case first. When a call is awaiting approval and it is not `steps[-1]`,
+            # the approved write never runs and nothing anywhere says so: this node reads exactly
+            # `steps[-1]` and returns. `pending_call_displaced` is the name for that, and it is a
+            # warning because a human is waiting for a write that will not happen.
+            awaiting = (state.get("pending_approval") or {}).get("tool_call_id")
+            displaced = bool(awaiting) and str(pending.get("tool_call_id") or "") != str(awaiting)
+            if displaced:
+                log.warning(
+                    "observe_noop",
+                    reason="pending_call_displaced",
+                    tool=str(pending.get("tool")) or None,
+                    awaiting_tool_call_id=str(awaiting),
+                    awaiting_tool=str((state.get("pending_approval") or {}).get("tool") or ""),
+                    trace_id=state.get("trace_id"),
+                )
+            else:
+                # Routine: this node can be entered when there is nothing outstanding (a re-entry, or a
+                # run whose last step already concluded). Debug rather than warning, so the two above
+                # keep their meaning.
+                log.debug(
+                    "observe_noop",
+                    reason="nothing_to_execute",
+                    tool=str(pending.get("tool")) or None,
+                    trace_id=state.get("trace_id"),
+                )
             return {}
 
         tool = str(pending.get("tool"))
