@@ -83,6 +83,7 @@ SAFE_FIELDS: Final[frozenset[str]] = frozenset(
         "write_uid",
         "user_id",
         "company_id",
+        "country_id",
         # counts and pagination
         "count",
         "task_count",
