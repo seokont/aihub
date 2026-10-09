@@ -464,12 +464,21 @@ class OdooClient:
         *,
         limit: int,
         order: str | None = None,
+        offset: int | None = None,
     ) -> list[dict[str, Any]]:
-        """``search_read`` with the field allowlist applied (never a raw read)."""
+        """``search_read`` with the field allowlist applied (never a raw read).
+
+        ``offset`` is optional and **omitted from the RPC when it is absent or zero**, so every existing
+        caller sends exactly the request it sent before this parameter existed -- which a regression test
+        holds, because "adding an optional argument" that quietly changes the wire request is how paging
+        semantics move under callers who never asked for them.
+        """
         field_list = checked_fields(model, list(fields))
         kwargs: dict[str, Any] = {"fields": field_list, "limit": limit}
         if order:
             kwargs["order"] = order
+        if offset:
+            kwargs["offset"] = offset
         rows = await self.execute_kw(model, "search_read", [list(domain)], kwargs)
         return [dict(row) for row in rows or []]
 
@@ -488,6 +497,17 @@ class OdooClient:
             msg = f"{model} {record_id} not found"
             raise OdooNotFound(msg)
         return rows[0]
+
+    async def search_count(self, model: str, domain: Sequence[Any]) -> int:
+        """`search_count`: the total under the same domain as the page, honouring record rules.
+
+        Deliberately not ``search`` followed by ``len``: the count is what this user's **record rules** allow
+        them to see, and pulling every id to count them would be both slower and a wider read than the
+        question asked for. It is the number pagination depends on, so it is asked of Odoo rather than
+        derived from a page.
+        """
+        total = await self.execute_kw(model, "search_count", [list(domain)], {})
+        return int(total)
 
     async def search(
         self,
