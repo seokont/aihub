@@ -1,9 +1,42 @@
 # Handoff — spike: free-form manager assistant (single tool-use loop)
 
-**Status:** guard core committed (`26fd8a1`); everything below is specified, not started.
+**Status:** `odoo_search`'s guard core and its I/O wrapper are **committed**; **3b is next**. The loop and the
+harness are specified here, not started.
 **Branch:** `spike/free-form-loop`, worktree `D:\moni-spike`. **`main` untouched at `3d824b4`.**
-**Why this doc:** the remaining work is four pieces that span the MCP package, the agent, compose and a new
-script, and it needs one uninterrupted pass rather than a partial one.
+
+| commit | what |
+| --- | --- |
+| `26fd8a1` | `odoo_search`'s guard core -- whitelists and validators, 17 tests, mutations firing |
+| `ae7b052` | this document |
+| `d3a99fd` | `search_read` gains an optional keyword-only `offset`, **omitted from the RPC when absent or zero** (two regression tests) |
+| `41bcede` | `SearchClient` shaped to the real client; stable `id`-suffixed order; the type-level check |
+
+**Order of work from here:** `pytest-timeout` as its own small commit (absent from the dev group; it would have
+turned this session's two hangs into immediate failures), then **3b** -- register `odoo_search` in both
+registries with the registry-agreement test green, plus the absence test until 3c lands -- then optionally try
+`odoo_search` inside the **existing pipeline** in the live chat (paging to 43, partner lookup) before spending
+more on the loop. 3c (the audit row, gateway-side) and 2b (anonymiser seeding from `money_fields`) follow.
+
+**Why this doc:** the remaining work spans the MCP package, the agent, compose and a new script, and it needs
+one uninterrupted pass rather than a partial one.
+
+### Two rules learned the hard way here
+
+**1. Read then Edit on the exact fresh text -- no generator scripts.** Three generated patch scripts failed:
+two on anchors `ruff format` had reflowed, one because the script itself did not parse -- so nothing was
+written while the intent looked applied, and `search_io.py` was left mid-migration (`stable_order` used,
+`_stable_order` never defined, no `order` parameter) because the failed generator had been the only record of
+what it was meant to do. Each failure was invisible until a later check and cost a pass. Read the file, make
+**one small edit**, then ruff and mypy on that file: that is what landed commit B, in five mechanical edits.
+If a generator is ever unavoidable, `python -m py_compile <script>` **first**.
+
+**2. A mutation sweep runs in the foreground, one mutation at a time, with a per-iteration timeout, and with
+the clean versions staged first.** A sweep rewrites production code, so a kill mid-iteration leaves a mutation
+in place -- which happened **twice** here, caught only by grepping for the marker and repairing from a
+pre-mutation backup with a SHA256 comparison. Stage the clean files so the undo is `git checkout -- <file>`,
+check the hash after every iteration, and never run a sweep as a background job. Bound every walk, too: an
+unbounded `while True:` paging test made one mutation **hang** instead of fail, twice, for over ten minutes --
+a guard whose removal hangs the suite is worse than one that fails.
 
 ---
 
