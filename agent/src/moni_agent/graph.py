@@ -1175,7 +1175,7 @@ class AgentRunner:
                 "stopped_reason": STOPPED_VERIFY_NO_TEXT,
             }
 
-        finished = verdict.startswith("DONE")
+        finished = verdict.startswith(VERDICT_DONE)
         self._tracer.node_span("verify", state, {"verdict": "DONE" if finished else "CONTINUE"})
         # `answer` is deliberately NOT touched here: only `respond` writes it, so a verdict
         # can never leak into the user-facing text.
@@ -1209,7 +1209,7 @@ class AgentRunner:
         last: BaseMessage | None = messages[-1] if messages else None
         # Messages are LangChain objects; read the attribute, never a dict key.
         content = str(getattr(last, "content", "") or "")
-        if content.strip().upper().startswith("DONE"):
+        if content.strip().upper().startswith(VERDICT_DONE):
             return "respond"
         if int(state.get("step_count") or 0) >= self._limits.max_steps:
             return "respond"
@@ -1269,8 +1269,18 @@ class AgentRunner:
             calls = self._calls(state, node="respond", result=result)
             finish_reason = result.finish_reason
             completion_tokens = result.completion_tokens
-            answer = (result.content or "").strip()
-            if not answer:
+            raw = (result.content or "").strip()
+            # A token on its own is not an answer; a token followed by a newline is the model echoing the
+            # control channel and the rest of the reply is the answer. `done` inside a sentence matches
+            # neither, so prose survives both branches.
+            token_only = bool(raw) and _is_control_token_only(raw)
+            answer = raw if not raw else _strip_control_token_prefix(raw).strip()
+            if token_only:
+                # The evidence is grounded, so the message must say the data arrived and the *model*
+                # produced a token — never that Odoo returned nothing.
+                outcome = _no_answer(limit_reason, state, control_token=True)
+                answer, reason = outcome.text, outcome.reason
+            elif not answer:
                 # The reported bug lived here: a non-empty answer was assumed, so a blank completion
                 # fell through to a message that blamed Odoo for a failure that had not happened.
                 outcome = _no_answer(limit_reason, state, model_blank=True)
@@ -1652,6 +1662,9 @@ NO_ANSWER_TOOL_ACCESS_REFUSED: Final = "tool_access_refused"
 NO_ANSWER_TOOL_FAILED: Final = "tool_failed"
 NO_ANSWER_LIMIT_REACHED: Final = "limit_reached"
 NO_ANSWER_MODEL_RETURNED_NO_TEXT: Final = "model_returned_no_text"
+#: The model echoed a control token instead of answering. Distinct from "returned no text": the text
+#: is non-empty and the data is grounded, which is exactly why the earlier guards let it through.
+NO_ANSWER_MODEL_RETURNED_CONTROL_TOKEN: Final = "model_returned_control_token"  # noqa: S105
 NO_ANSWER_TOOL_RETURNED_NO_DATA: Final = "tool_returned_no_data"
 NO_ANSWER_NO_TOOLS_RAN: Final = "no_tools_ran"
 
@@ -1662,8 +1675,25 @@ NO_ANSWER_NO_TOOLS_RAN: Final = "no_tools_ran"
 STOPPED_PLAN_NO_TEXT: Final = "plan_returned_no_text"
 STOPPED_VERIFY_NO_TEXT: Final = "verify_returned_no_text"
 
+#: The verdict vocabulary the graph itself uses, named once and referenced by the readers below so
+#: the guard's token set is *derived* from what the graph emits rather than a second hand-written pair
+#: that drifts beside it. `verify` reads DONE; `plan` asks for CONTINUE.
+VERDICT_DONE: Final = "DONE"
+VERDICT_CONTINUE: Final = "CONTINUE"
+CONTROL_TOKENS: Final = (VERDICT_DONE, VERDICT_CONTINUE)
+
 #: Prefixed to an answer that *is* grounded when the run could not be verified. The summary is
 #: real, so it is kept; what must not happen is that it reads as a verified result.
+#: Shown when the model echoed a control token instead of a summary. It says the **data was fetched**,
+#: because blaming Odoo for a model fault is the mistake `_no_answer`'s own docstring records from the
+#: earlier server finding, and a user who is told the data is missing will ask again anyway.
+# A reason code and a user-facing sentence, not a credential: bandit's heuristic reads the word
+# TOKEN in the name.
+_CONTROL_ECHO_MESSAGE: Final = (
+    "Не вдалося підготувати відповідь: модель повернула службовий токен замість підсумку.\n"
+    "Дані з Odoo отримано, але модель не сформувала відповідь. Будь ласка, повторіть запитання."
+)
+
 _UNVERIFIED_CAVEAT: Final = (
     "⚠ Не вдалося підтвердити результат: "
     "перевірка не повернула вердикт. "
@@ -1679,8 +1709,38 @@ class _NoAnswer:
     text: str
 
 
+def _is_control_token_only(text: str) -> bool:
+    """True when the whole reply is one verdict token, modulo surrounding punctuation.
+
+    Trailing punctuation is tolerated because a model that echoes `DONE` often writes `DONE.`; a token
+    with anything else in the text is not this case and is handled by the prefix strip instead.
+    """
+    stripped = text.strip().strip(".!:").strip()
+    return stripped.upper() in CONTROL_TOKENS
+
+
+def _strip_control_token_prefix(text: str) -> str:
+    """Drop a leading verdict token **in verdict form**: at the very start, then a newline.
+
+    That is the shape of the model echoing the control channel. A token inside a sentence is prose —
+    "Задачу S22714 done, решта в роботі" is a real answer — so the strip is deliberately narrow: start
+    of text, token alone on its line. Anything wider corrupts ordinary replies, which is why a test
+    pins the sentence case.
+    """
+    upper = text.upper()
+    for token in CONTROL_TOKENS:
+        for separator in (f"{token}\n", f"{token}\r\n"):
+            if upper.startswith(separator):
+                return text[len(separator) :]
+    return text
+
+
 def _no_answer(
-    limit_reason: str | None, state: AgentState, *, model_blank: bool = False
+    limit_reason: str | None,
+    state: AgentState,
+    *,
+    model_blank: bool = False,
+    control_token: bool = False,
 ) -> _NoAnswer:
     """Why the run has no answer, and the honest message for that reason.
 
@@ -1778,6 +1838,9 @@ def _no_answer(
             NO_ANSWER_TOOL_RETURNED_NO_DATA,
             "Запит виконано, але Odoo не повернув даних за цими умовами. Спробуйте уточнити запит.",
         )
+
+    if control_token:
+        return _NoAnswer(NO_ANSWER_MODEL_RETURNED_CONTROL_TOKEN, _CONTROL_ECHO_MESSAGE)
 
     if model_blank:
         return _NoAnswer(
