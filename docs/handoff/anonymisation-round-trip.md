@@ -1,6 +1,7 @@
 # Handoff — the anonymisation round trip on the primary path (2a's leftover asymmetry)
 
-**Status:** defect reproduced by test, **not fixed**. The two reproductions are **uncommitted** on `main`.
+**Status:** defect reproduced by test and **committed as `xfail(strict=True)`** (`11df467`); **not fixed**.
+The tree is green and pushable; the markers come off as the fix lands.
 **Where:** `main` (`D:\MEDINSKY_Start2`), HEAD `3d824b4`, 18 ahead of `origin/main`, nothing pushed.
 **Why this doc:** the fix is a design change across `router/src/moni_router/chat.py` and `policy.py` plus four
 tests and four mutations. It did not fit one pass, and a half-applied version of it would be worse than none —
@@ -101,10 +102,16 @@ paging test made one mutation *hang* instead of fail, twice).
 
 ## State at handoff
 
-* `main` HEAD `3d824b4`; **uncommitted**: `tests/unit/router/test_placeholder_roundtrip.py` (new, two
-  reproductions, both failing) and the deletion of `tests/unit/agent/test_placeholder_restoration.py`.
-  Last run: **`2 failed in 0.30s`**.
-* No production code touched. No fix. No mutations run.
+* `main` HEAD **`11df467`**; the reproductions are **committed as `xfail(strict=True)`**, not uncommitted:
+  `tests/unit/router/test_placeholder_roundtrip.py` carries both of them with the diagnosis in the marker
+  reason, and `tests/unit/agent/test_placeholder_restoration.py` (the layer-wrong one) is deleted. Last full
+  run: **`1395 passed, 2 xfailed`** — green and pushable.
+* **`strict=True` is load-bearing: remove each marker as its half of the fix lands.** While the fix is
+  incomplete the marker keeps the tree green; if the fix lands and the marker is left, the run fails loudly
+  rather than passing quietly. That is the ordering error this session made twice in other forms.
+* No production code touched. No fix. No mutations run. None of the five tests below exist yet: the four
+  restore-site tests, the split-across-frames test, the literal-`{...}` test, the `unrestored_placeholder`
+  test and the branch-agnostic guard test all still need writing alongside the wrapper.
 * `spike/free-form-loop` is untouched at `e8e249f`; its `pyproject.toml`/`uv.lock` are reverted, so
   `pytest-timeout` is still to be finished there (dependency + a `timeout` under
   `[tool.pytest.ini_options]`, `timeout_method = "thread"` on Windows).
